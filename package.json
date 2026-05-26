@@ -1,0 +1,31 @@
+{
+  "name": "baryga-manga",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "auth": "tsx src/index.ts auth",
+    "build": "tsc -p tsconfig.json",
+    "check-auth": "tsx src/index.ts check-auth",
+    "list-trades": "tsx src/index.ts list-trades",
+    "run-bot": "tsx src/index.ts run-bot",
+    "scan-trades": "tsx src/index.ts scan-trades",
+    "serve": "tsx src/index.ts serve",
+    "verify-ranks": "tsx src/index.ts verify-ranks",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@playwright/test": "^1.52.0",
+    "better-sqlite3": "^11.10.0",
+    "dotenv": "^16.5.0",
+    "playwright": "^1.52.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
+}
