@@ -120,7 +120,10 @@ async function openMangabuffBrowser(options: {
   storageStatePath: string;
   useSavedSession: boolean;
 }): Promise<BrowserSession> {
-  const browser = await chromium.launch({ headless: options.headless });
+  const browser = await chromium.launch({
+    args: ["--disable-dev-shm-usage", "--no-sandbox"],
+    headless: options.headless,
+  });
   const context = await browser.newContext({
     storageState:
       options.useSavedSession && (await fileExists(options.storageStatePath))
