@@ -820,15 +820,38 @@ async function openTradesPage(page: Page): Promise<void> {
 }
 
 async function openOffersTab(page: Page): Promise<void> {
-  const offersTab = page.getByText("Предложения", { exact: true });
+  if (new URL(page.url()).pathname === "/trades") {
+    return;
+  }
 
-  if (!(await offersTab.first().isVisible({ timeout: 3_000 }).catch(() => false))) {
+  const offersTabs = page.locator('a[href="/trades"], a[href="https://mangabuff.ru/trades"]').filter({
+    hasText: /предложения/i,
+  });
+  const clicked = await clickFirstVisible(offersTabs);
+
+  if (!clicked) {
     throw new Error('Не удалось найти вкладку "Предложения" в разделе обменов.');
   }
 
-  await offersTab.click({ timeout: 3_000 }).catch(() => {});
   await page.waitForLoadState("domcontentloaded").catch(() => {});
   await page.waitForTimeout(500);
+}
+
+async function clickFirstVisible(locator: Locator): Promise<boolean> {
+  const count = await locator.count();
+
+  for (let index = 0; index < count; index += 1) {
+    const candidate = locator.nth(index);
+
+    if (!(await candidate.isVisible().catch(() => false))) {
+      continue;
+    }
+
+    await candidate.click({ timeout: 3_000 });
+    return true;
+  }
+
+  return false;
 }
 
 async function extractVisibleTradeLinks(page: Page): Promise<VisibleTrade[]> {
