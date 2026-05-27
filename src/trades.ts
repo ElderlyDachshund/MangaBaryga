@@ -92,11 +92,12 @@ export async function runVisibleTradesLoop(
   settings: BotSettings,
   options: TradesLoopOptions = {},
 ): Promise<void> {
-  const session = await openSavedMangabuffSession(settings);
+  let session: BrowserSession | undefined;
   let passNumber = 0;
 
   try {
     while (!options.signal?.aborted) {
+      session ??= await openSavedMangabuffSession(settings);
       passNumber += 1;
       const result = await runTradesPass(db, session, settings, passNumber);
       options.onPass?.(result);
@@ -106,10 +107,15 @@ export async function runVisibleTradesLoop(
         break;
       }
 
+      if (result.status === "temporary_error" && shouldReopenBrowserSession(result.reason)) {
+        await closeBrowserSession(session);
+        session = undefined;
+      }
+
       await waitForNextPass(settings.loopPauseMs, options.signal);
     }
   } finally {
-    await session.browser.close();
+    await closeBrowserSession(session);
   }
 }
 
@@ -131,6 +137,14 @@ async function runTradesPass(
 
     return { status: "temporary_error", passNumber, reason };
   }
+}
+
+async function closeBrowserSession(session: BrowserSession | undefined): Promise<void> {
+  await session?.browser.close().catch(() => {});
+}
+
+function shouldReopenBrowserSession(reason: string): boolean {
+  return reason.includes("Page crashed") || reason.includes("Target page, context or browser has been closed");
 }
 
 async function scanVisibleTradesInSession(
