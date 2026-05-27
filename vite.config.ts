@@ -6,7 +6,7 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   build: {
     outDir: "dist/web",
-    emptyOutDir: true,
+    emptyOutDir: false,
   },
   server: {
     host: "127.0.0.1",
