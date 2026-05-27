@@ -2,6 +2,7 @@ node_modules/
 dist/
 .env
 .env.local
+mangabuff.json
 data/
 playwright/.auth/
 test-results/
