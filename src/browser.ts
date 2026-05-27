@@ -6,7 +6,8 @@ import { stdin as input, stdout as output } from "node:process";
 import type { BotSettings } from "./domain.js";
 
 export const mangabuffTradesUrl = "https://mangabuff.ru/trades";
-export const mangabuffStorageStatePath = "playwright/.auth/mangabuff.json";
+export const mangabuffStorageStatePath =
+  process.env.MANGABUFF_STORAGE_STATE_PATH ?? "playwright/.auth/mangabuff.json";
 
 export interface BrowserSession {
   browser: Browser;

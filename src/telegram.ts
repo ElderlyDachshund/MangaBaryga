@@ -1,9 +1,13 @@
+import { Bot, GrammyError, HttpError as GrammyHttpError } from "grammy";
 import type { BotSettings, TradeCard, TradeRecord } from "./domain.js";
 
 interface TelegramSettings extends BotSettings {
   telegramBotToken: string;
   telegramChatId: string;
 }
+
+let cachedBotToken: string | undefined;
+let cachedBot: Bot | undefined;
 
 export function assertTelegramConfigured(settings: BotSettings): asserts settings is TelegramSettings {
   if (!settings.telegramBotToken || !settings.telegramChatId) {
@@ -64,24 +68,30 @@ function formatRankRuleResult(result: TradeRecord["rankRuleResult"]): string {
 }
 
 async function sendTelegramMessage(settings: TelegramSettings, text: string): Promise<void> {
-  const response = await fetch(
-    `https://api.telegram.org/bot${settings.telegramBotToken}/sendMessage`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: settings.telegramChatId,
-        text,
-        disable_web_page_preview: true,
-      }),
-    },
-  );
+  try {
+    await getTelegramBot(settings.telegramBotToken).api.sendMessage(settings.telegramChatId, text, {
+      link_preview_options: { is_disabled: true },
+    });
+  } catch (error) {
+    if (error instanceof GrammyError) {
+      throw new Error(`Telegram вернул ошибку ${error.error_code}: ${error.description}`);
+    }
 
-  if (response.ok) {
-    return;
+    if (error instanceof GrammyHttpError) {
+      throw new Error(`Telegram недоступен: ${error.message}`);
+    }
+
+    throw error;
+  }
+}
+
+function getTelegramBot(token: string): Bot {
+  if (cachedBot && cachedBotToken === token) {
+    return cachedBot;
   }
 
-  const responseText = await response.text().catch(() => "");
-  const details = responseText ? ` ${responseText.slice(0, 300)}` : "";
-  throw new Error(`Telegram вернул ошибку ${response.status}.${details}`);
+  cachedBotToken = token;
+  cachedBot = new Bot(token);
+
+  return cachedBot;
 }

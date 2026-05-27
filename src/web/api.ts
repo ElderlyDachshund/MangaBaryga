@@ -1,0 +1,113 @@
+import type { BotSettings, TradeRecord } from "../domain";
+
+export type ApiRuntimePass =
+  | {
+      status: "ok";
+      passNumber: number;
+      visibleTrades: Array<{ tradeId: string; tradeUrl: string }>;
+      insertedCount: number;
+      staleCount: number;
+      processedCount: number;
+      parsedCount: number;
+      pagesCheckedCount: number;
+      rulesDroppedCount: number;
+      ranksCheckedCount: number;
+      safeAcceptCount: number;
+      acceptedCount: number;
+      manualReviewCount: number;
+      checkErrorCount: number;
+      pageStaleCount: number;
+      skippedCount: number;
+    }
+  | {
+      status: "auth_required";
+      passNumber: number;
+    }
+  | {
+      status: "temporary_error";
+      passNumber: number;
+      reason: string;
+    };
+
+export interface ApiSettings {
+  telegramConfigured: boolean;
+  telegramChatId?: string;
+  safeMode: boolean;
+  autoAcceptEnabled: boolean;
+  autoAcceptLocked: boolean;
+  maxWantedPagesExclusive: number;
+  loopPauseMs: number;
+  browserMode: BotSettings["browserMode"];
+  rankRecognitionVerified: boolean;
+}
+
+export interface ApiState {
+  settings: ApiSettings;
+  runtime: {
+    running: boolean;
+    stopping: boolean;
+    startedAt?: string;
+    stoppedAt?: string;
+    lastPass?: ApiRuntimePass;
+    lastError?: string;
+  };
+  auth: {
+    manualAuthActive: boolean;
+  };
+  trades: TradeRecord[];
+}
+
+export interface SettingsPatch {
+  telegramBotToken?: string;
+  telegramChatId?: string;
+  maxWantedPagesExclusive: number;
+  loopPauseMs: number;
+  browserMode: BotSettings["browserMode"];
+  safeMode: boolean;
+  autoAcceptEnabled: boolean;
+}
+
+export async function loadState(): Promise<ApiState> {
+  return request<ApiState>("/api/state");
+}
+
+export async function saveSettings(patch: SettingsPatch): Promise<ApiSettings> {
+  return request<ApiSettings>("/api/settings", {
+    body: JSON.stringify(patch),
+    method: "PATCH",
+  });
+}
+
+export async function startBot(): Promise<ApiState> {
+  return request<ApiState>("/api/bot/start", { method: "POST" });
+}
+
+export async function stopBot(): Promise<ApiState> {
+  return request<ApiState>("/api/bot/stop", { method: "POST" });
+}
+
+export async function startAuth(): Promise<{ active: boolean }> {
+  return request<{ active: boolean }>("/api/auth/start", { method: "POST" });
+}
+
+export async function completeAuth(): Promise<{ saved: boolean }> {
+  return request<{ saved: boolean }>("/api/auth/complete", { method: "POST" });
+}
+
+export async function checkAuth(): Promise<{ authorized: boolean }> {
+  return request<{ authorized: boolean }>("/api/auth/status");
+}
+
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const response = await fetch(path, {
+    headers: { "Content-Type": "application/json", ...options.headers },
+    ...options,
+  });
+  const payload = (await response.json()) as T | { error?: string };
+
+  if (!response.ok) {
+    throw new Error("error" in payload && payload.error ? payload.error : "Запрос не выполнен");
+  }
+
+  return payload as T;
+}

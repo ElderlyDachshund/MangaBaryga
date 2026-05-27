@@ -39,6 +39,7 @@ switch (command) {
     console.log(`Брошено по правилам: ${result.rulesDroppedCount}`);
     console.log(`Ранги проверены: ${result.ranksCheckedCount}`);
     console.log(`Safe mode "бот бы принял": ${result.safeAcceptCount}`);
+    console.log(`Принято ботом: ${result.acceptedCount}`);
     console.log(`Отправлено на ручную проверку: ${result.manualReviewCount}`);
     console.log(`Технических ошибок проверки: ${result.checkErrorCount}`);
     console.log(`Отменённых или уже принятых обменов помечено неактуальными: ${result.pageStaleCount}`);
@@ -143,6 +144,7 @@ switch (command) {
     console.log("Options:");
     console.log("  --limit=50         Количество записей для list-trades: 1-200");
     console.log("  --headful          Открыть видимый браузер для диагностики");
+    console.log("  --auto-accept      Включить рабочий режим: принимать обмены, прошедшие правила");
     console.log("  --pause-ms=6000    Пауза между проходами: 1000-10000 мс");
   }
 }
@@ -153,6 +155,11 @@ function applyCliSettings(): void {
 
   if (process.argv.includes("--headful")) {
     settings.browserMode = "headful";
+  }
+
+  if (process.argv.includes("--auto-accept")) {
+    settings.safeMode = false;
+    settings.autoAcceptEnabled = true;
   }
 
   const pauseArg = process.argv.find((arg) => arg.startsWith("--pause-ms="));
@@ -189,7 +196,7 @@ function logTradesPass(result: TradesPassResult): void {
   }
 
   console.log(
-    `[${time}] Проход ${result.passNumber}: видимых ${result.visibleTrades.length}, новых ${result.insertedCount}, страницы проверены ${result.pagesCheckedCount}, ранги проверены ${result.ranksCheckedCount}, бот бы принял ${result.safeAcceptCount}, брошено по правилам ${result.rulesDroppedCount}, ручная проверка ${result.manualReviewCount}, ошибок ${result.checkErrorCount}, неактуальных ${result.staleCount + result.pageStaleCount}, пропущено ${result.skippedCount}.`,
+    `[${time}] Проход ${result.passNumber}: видимых ${result.visibleTrades.length}, новых ${result.insertedCount}, страницы проверены ${result.pagesCheckedCount}, ранги проверены ${result.ranksCheckedCount}, принято ${result.acceptedCount}, бот бы принял ${result.safeAcceptCount}, брошено по правилам ${result.rulesDroppedCount}, ручная проверка ${result.manualReviewCount}, ошибок ${result.checkErrorCount}, неактуальных ${result.staleCount + result.pageStaleCount}, пропущено ${result.skippedCount}.`,
   );
 }
 
@@ -246,9 +253,7 @@ function assertAutoAcceptIsSafe(): void {
     return;
   }
 
-  if (!settings.rankRecognitionVerified) {
-    throw new Error(
-      "Автоматическое принятие заблокировано: распознавание рангов не реализовано и не проверено.",
-    );
+  if (settings.safeMode) {
+    throw new Error("Автоматическое принятие несовместимо с безопасным режимом.");
   }
 }

@@ -57,7 +57,9 @@ interface SettingRow {
 
 export type AppDatabase = Database.Database;
 
-export function openDatabase(path = "data/baryga-manga.sqlite"): AppDatabase {
+export function openDatabase(
+  path = process.env.DATABASE_PATH ?? process.env.DB_PATH ?? "data/baryga-manga.sqlite",
+): AppDatabase {
   mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path);
   db.pragma("journal_mode = WAL");

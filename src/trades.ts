@@ -5,6 +5,7 @@ import {
   insertNewTrade,
   markTradeTelegramSent,
   markMissingTradesAsStale,
+  recordTradeAcceptAttempt,
   recordTradeCheckFailure,
   updateTradeParsedData,
   updateTradeRankRuleResult,
@@ -42,6 +43,7 @@ export interface ScanTradesResult {
   rulesDroppedCount: number;
   ranksCheckedCount: number;
   safeAcceptCount: number;
+  acceptedCount: number;
   skippedCount: number;
 }
 
@@ -166,6 +168,7 @@ async function scanVisibleTradesInSession(
     rulesDroppedCount: 0,
     ranksCheckedCount: 0,
     safeAcceptCount: 0,
+    acceptedCount: 0,
     skippedCount: 0,
   };
 
@@ -182,6 +185,7 @@ async function scanVisibleTradesInSession(
     processingStats.rulesDroppedCount += result.outcome === "rules_dropped" ? 1 : 0;
     processingStats.ranksCheckedCount += result.ranksChecked ? 1 : 0;
     processingStats.safeAcceptCount += result.outcome === "safe_accept" ? 1 : 0;
+    processingStats.acceptedCount += result.outcome === "accepted" ? 1 : 0;
     processingStats.skippedCount += result.outcome === "skipped" ? 1 : 0;
   }
 
@@ -196,6 +200,7 @@ type ProcessTradeOutcome =
   | "pages_checked"
   | "rules_dropped"
   | "safe_accept"
+  | "accepted"
   | "skipped";
 
 function isParsedTradeOutcome(outcome: ProcessTradeOutcome): boolean {
@@ -203,7 +208,8 @@ function isParsedTradeOutcome(outcome: ProcessTradeOutcome): boolean {
     outcome === "parsed" ||
     outcome === "pages_checked" ||
     outcome === "rules_dropped" ||
-    outcome === "safe_accept"
+    outcome === "safe_accept" ||
+    outcome === "accepted"
   );
 }
 
@@ -232,11 +238,17 @@ async function processVisibleTrade(
 ): Promise<ProcessTradeResult> {
   const record = findTradeById(db, trade.tradeId);
 
-  if (!shouldProcessTrade(record)) {
+  if (!shouldProcessTrade(record, settings)) {
     return { processed: false, outcome: "skipped" };
   }
 
   try {
+    if (record?.status === "принят" && record.acceptAttempts >= 2) {
+      const reason = "Обмен снова появился во вкладке предложений после двух попыток принятия.";
+      updateTradeStatus(db, trade.tradeId, "требует_ручной_проверки", reason);
+      return { processed: true, outcome: "manual_review" };
+    }
+
     await openTradePage(page, trade.tradeUrl);
     const pageState = await getTradePageState(page);
 
@@ -255,6 +267,11 @@ async function processVisibleTrade(
     }
 
     if (pageState === "accepted") {
+      if ((record?.acceptAttempts ?? 0) > 0) {
+        updateTradeStatus(db, trade.tradeId, "принят", "Сайт показывает, что обмен принят этим ботом.");
+        return { processed: true, outcome: "accepted" };
+      }
+
       updateTradeStatus(db, trade.tradeId, "неактуален", "Обмен уже принят не этим ботом.");
       return { processed: true, outcome: "stale" };
     }
@@ -330,6 +347,11 @@ async function processVisibleTrade(
 
     updateTradeRankRuleResult(db, trade.tradeId, "выполнено", reason);
     updateTradeWantedPagesCount(db, trade.tradeId, wantedPagesCount, reason);
+
+    if (!settings.safeMode && settings.autoAcceptEnabled) {
+      return await acceptTradeAfterRulesPass(db, page, trade, record, reason);
+    }
+
     updateTradeStatus(db, trade.tradeId, "бот_бы_принял", reason);
 
     return { processed: true, outcome: "safe_accept", pagesChecked: true, ranksChecked: true };
@@ -342,6 +364,104 @@ async function processVisibleTrade(
 
     return { processed: true, outcome: status === "ошибка_проверки" ? "check_error" : "manual_review" };
   }
+}
+
+async function acceptTradeAfterRulesPass(
+  db: AppDatabase,
+  page: Page,
+  trade: VisibleTrade,
+  record: TradeRecord | undefined,
+  ruleReason: string,
+): Promise<ProcessTradeResult> {
+  if ((record?.acceptAttempts ?? 0) >= 2) {
+    const reason = `Исчерпаны 2 попытки принятия. ${ruleReason}`;
+    updateTradeStatus(db, trade.tradeId, "требует_ручной_проверки", reason);
+    return { processed: true, outcome: "manual_review", pagesChecked: true, ranksChecked: true };
+  }
+
+  await openTradePage(page, trade.tradeUrl);
+  const pageState = await getTradePageState(page);
+
+  if (pageState === "not_found") {
+    const status = recordTradeCheckFailure(
+      db,
+      trade.tradeId,
+      "Страница обмена недоступна перед принятием.",
+    );
+    return {
+      processed: true,
+      outcome: status === "ошибка_проверки" ? "check_error" : "manual_review",
+      pagesChecked: true,
+      ranksChecked: true,
+    };
+  }
+
+  if (pageState === "cancelled") {
+    updateTradeStatus(db, trade.tradeId, "неактуален", "Обмен отменен на сайте перед принятием.");
+    return { processed: true, outcome: "stale", pagesChecked: true, ranksChecked: true };
+  }
+
+  if (pageState === "accepted") {
+    updateTradeStatus(db, trade.tradeId, "неактуален", "Обмен уже принят до клика этого бота.");
+    return { processed: true, outcome: "stale", pagesChecked: true, ranksChecked: true };
+  }
+
+  const acceptButton = page.locator("button, a").filter({ hasText: /^\s*Принять обмен\s*$/ }).first();
+
+  if (!(await acceptButton.isVisible({ timeout: 5_000 }).catch(() => false))) {
+    throw new Error('не удалось найти кнопку "Принять обмен"');
+  }
+
+  recordTradeAcceptAttempt(db, trade.tradeId);
+  await acceptButton.click({ timeout: 5_000 });
+  await confirmAcceptIfNeeded(page);
+
+  if (await waitForAcceptedTradeState(page, trade.tradeUrl)) {
+    const reason = ruleReason.replace("Бот бы принял обмен", "Бот принял обмен");
+    updateTradeStatus(db, trade.tradeId, "принят", reason);
+    return { processed: true, outcome: "accepted", pagesChecked: true, ranksChecked: true };
+  }
+
+  const status = recordTradeCheckFailure(
+    db,
+    trade.tradeId,
+    "Бот нажал принятие, но сайт не показал статус `Обмен принят`.",
+  );
+
+  return {
+    processed: true,
+    outcome: status === "ошибка_проверки" ? "check_error" : "manual_review",
+    pagesChecked: true,
+    ranksChecked: true,
+  };
+}
+
+async function confirmAcceptIfNeeded(page: Page): Promise<void> {
+  const confirmButton = page
+    .locator('[role="dialog"] button, .modal button, [class*="modal"] button, [class*="Modal"] button')
+    .filter({ hasText: /^\s*Принять\s*$/ })
+    .last();
+
+  if (await confirmButton.isVisible({ timeout: 5_000 }).catch(() => false)) {
+    await confirmButton.click({ timeout: 5_000 });
+  }
+
+  await page.waitForLoadState("domcontentloaded").catch(() => {});
+  await page.waitForTimeout(800);
+}
+
+async function waitForAcceptedTradeState(page: Page, tradeUrl: string): Promise<boolean> {
+  if (await hasAcceptedTradeText(page)) {
+    return true;
+  }
+
+  await openTradePage(page, tradeUrl);
+  return hasAcceptedTradeText(page);
+}
+
+async function hasAcceptedTradeText(page: Page): Promise<boolean> {
+  const bodyText = await page.locator("body").innerText({ timeout: 8_000 }).catch(() => "");
+  return bodyText.includes("Обмен принят");
 }
 
 function getRuleFailureDecision(
@@ -390,8 +510,16 @@ function formatRankSummary(requestedRank: CardRank, offeredRanks: CardRank[]): s
   return `запрошена ${requestedRank}, предлагают ${offeredRanks.join(", ")}`;
 }
 
-function shouldProcessTrade(record: TradeRecord | undefined): boolean {
+function shouldProcessTrade(record: TradeRecord | undefined, settings: BotSettings): boolean {
   if (!record) {
+    return true;
+  }
+
+  if (record.status === "бот_бы_принял") {
+    return !settings.safeMode && settings.autoAcceptEnabled;
+  }
+
+  if (record.status === "принят") {
     return true;
   }
 
@@ -399,7 +527,7 @@ function shouldProcessTrade(record: TradeRecord | undefined): boolean {
     return true;
   }
 
-  if (isFinalTradeStatus(record.status) || record.status === "принят") {
+  if (isFinalTradeStatus(record.status)) {
     return false;
   }
 
