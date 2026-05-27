@@ -1,13 +1,13 @@
 FROM node:20-bookworm-slim
 
-WORKDIR /app
+WORKDIR /opt/baryga-manga
 
 COPY package*.json ./
 RUN npm ci
 
 COPY . .
 RUN npm run build
-RUN test -f /app/dist/index.js && test -f /app/dist/web/index.html
+RUN test -f /opt/baryga-manga/dist/index.js && test -f /opt/baryga-manga/dist/web/index.html
 RUN npm prune --omit=dev
 RUN node node_modules/playwright/cli.js install --with-deps --only-shell chromium
 
@@ -25,4 +25,4 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 3000) + '/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
-CMD ["node", "/app/dist/index.js", "serve"]
+CMD ["node", "/opt/baryga-manga/dist/index.js", "serve"]
