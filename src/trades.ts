@@ -25,6 +25,8 @@ import { isSupportedCardRank, recognizeCardPageRank } from "./ranks.js";
 import { passesDefaultRankRule, passesWantedPagesRule } from "./rules.js";
 import { sendAuthRequiredNotification, sendTradeProblemNotification } from "./telegram.js";
 
+const tradePassTimeoutMs = 45_000;
+
 export interface VisibleTrade {
   tradeId: string;
   tradeUrl: string;
@@ -99,7 +101,7 @@ export async function runVisibleTradesLoop(
     while (!options.signal?.aborted) {
       session ??= await openSavedMangabuffSession(settings);
       passNumber += 1;
-      const result = await runTradesPass(db, session, settings, passNumber);
+      const result = await runTradesPassWithTimeout(db, session, settings, passNumber);
       options.onPass?.(result);
 
       if (result.status === "auth_required") {
@@ -139,12 +141,44 @@ async function runTradesPass(
   }
 }
 
+async function runTradesPassWithTimeout(
+  db: AppDatabase,
+  session: BrowserSession,
+  settings: BotSettings,
+  passNumber: number,
+): Promise<TradesPassResult> {
+  let timeout: NodeJS.Timeout | undefined;
+
+  const timeoutResult = new Promise<TradesPassResult>((resolve) => {
+    timeout = setTimeout(() => {
+      void closeBrowserSession(session);
+      resolve({
+        status: "temporary_error",
+        passNumber,
+        reason: `Проход проверки завис дольше ${tradePassTimeoutMs / 1_000} секунд; браузерная сессия перезапущена.`,
+      });
+    }, tradePassTimeoutMs);
+  });
+
+  try {
+    return await Promise.race([runTradesPass(db, session, settings, passNumber), timeoutResult]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
 async function closeBrowserSession(session: BrowserSession | undefined): Promise<void> {
   await session?.browser.close().catch(() => {});
 }
 
 function shouldReopenBrowserSession(reason: string): boolean {
-  return reason.includes("Page crashed") || reason.includes("Target page, context or browser has been closed");
+  return (
+    reason.includes("Page crashed") ||
+    reason.includes("Target page, context or browser has been closed") ||
+    reason.includes("браузерная сессия перезапущена")
+  );
 }
 
 async function scanVisibleTradesInSession(
