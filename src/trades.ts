@@ -568,9 +568,73 @@ function isProblemStatusForTelegram(status: TradeRecord["status"]): boolean {
 }
 
 async function countWantedPagesForRequestedCard(page: Page, requestedCard: TradeCard): Promise<number> {
-  await openRequestedCardPage(page, requestedCard);
-  await openWantedUsersSection(page);
-  return countWantedUsersPages(page);
+  const html = await fetchWantedUsersPageHtml(page, requestedCard);
+  return countWantedUsersPagesFromHtml(html);
+}
+
+async function fetchWantedUsersPageHtml(page: Page, requestedCard: TradeCard): Promise<string> {
+  try {
+    const response = await page.context().request.get(requestedCard.url, { timeout: 20_000 });
+
+    if (!response.ok()) {
+      throw new Error(`HTTP ${response.status()}`);
+    }
+
+    return await response.text();
+  } catch (error) {
+    throw new Error(`не удалось открыть страницу запрошенной карты ${requestedCard.cardId}: ${formatError(error)}`);
+  }
+}
+
+function countWantedUsersPagesFromHtml(html: string): number {
+  const paginationPagesCount = readPaginationPagesCountFromHtml(html);
+
+  if (paginationPagesCount !== undefined) {
+    return paginationPagesCount;
+  }
+
+  const text = htmlToText(html);
+
+  if (hasEmptyWantedUsersText(text)) {
+    return 0;
+  }
+
+  if (html.includes("card-show__owner") || /href=["']\/users\/\d+/i.test(html)) {
+    return 1;
+  }
+
+  return 0;
+}
+
+function readPaginationPagesCountFromHtml(html: string): number | undefined {
+  const pageNumbers = [...html.matchAll(/[?&]page=(\d+)/g)]
+    .map((match) => Number(match[1]))
+    .filter((pageNumber) => Number.isInteger(pageNumber) && pageNumber > 0);
+
+  if (pageNumbers.length === 0) {
+    return undefined;
+  }
+
+  return Math.max(...pageNumbers);
+}
+
+function htmlToText(html: string): string {
+  return normalizeText(
+    html
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " "),
+  )?.toLowerCase() ?? "";
+}
+
+function hasEmptyWantedUsersText(text: string): boolean {
+  return [
+    "никто не хочет получить",
+    "нет желающих",
+    "нет пользователей",
+    "пользователей не найдено",
+    "список пуст",
+  ].some((emptyText) => text.includes(emptyText));
 }
 
 async function openRequestedCardPage(page: Page, requestedCard: TradeCard): Promise<void> {
