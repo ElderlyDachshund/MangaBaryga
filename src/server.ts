@@ -2,6 +2,7 @@ import "dotenv/config";
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
+import { cors } from "hono/cors";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -70,6 +71,7 @@ export function startControlServer(port = readPort()): void {
 
 function createControlApp(): Hono {
   const app = new Hono();
+  const webOrigins = readWebOrigins();
 
   app.onError((error) => {
     const statusCode = error instanceof HttpError ? error.statusCode : 500;
@@ -81,6 +83,17 @@ function createControlApp(): Hono {
       statusCode,
     );
   });
+
+  if (webOrigins) {
+    app.use(
+      "/api/*",
+      cors({
+        allowHeaders: ["Content-Type"],
+        allowMethods: ["GET", "PATCH", "POST", "OPTIONS"],
+        origin: webOrigins,
+      }),
+    );
+  }
 
   app.get("/api/state", (context) => context.json(buildState(db)));
   app.get("/health", (context) => context.json({ ok: true }));
@@ -401,4 +414,16 @@ function readPort(): number {
 
 function readHostname(): string {
   return process.env.HOST?.trim() || "127.0.0.1";
+}
+
+function readWebOrigins(): string | string[] | undefined {
+  const origins = process.env.WEB_ORIGIN?.split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+
+  if (!origins?.length) {
+    return undefined;
+  }
+
+  return origins.length === 1 ? origins[0] : origins;
 }

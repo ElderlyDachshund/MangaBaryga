@@ -99,7 +99,7 @@ export async function checkAuth(): Promise<{ authorized: boolean }> {
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(path, {
+  const response = await fetch(apiUrl(path), {
     headers: { "Content-Type": "application/json", ...options.headers },
     ...options,
   });
@@ -110,4 +110,18 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   }
 
   return payload as T;
+}
+
+function apiUrl(path: string): string {
+  const baseUrl = import.meta.env.VITE_API_BASE_URL?.trim();
+
+  if (!baseUrl) {
+    return path;
+  }
+
+  return new URL(path, ensureTrailingSlash(baseUrl)).toString();
+}
+
+function ensureTrailingSlash(value: string): string {
+  return value.endsWith("/") ? value : `${value}/`;
 }
