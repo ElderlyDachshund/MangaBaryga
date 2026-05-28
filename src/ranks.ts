@@ -1,6 +1,10 @@
 import type { Page } from "playwright";
+import sharp from "sharp";
 import { supportedRanks, type CardRank, type SupportedCardRank } from "./domain.js";
 import { rankSamples, type RankSample } from "./rank-samples.js";
+
+sharp.cache(false);
+sharp.concurrency(1);
 
 interface RankColorFeatures {
   hue: number;
@@ -89,6 +93,17 @@ export async function recognizeCardRankFromImage(
   return { rank, features };
 }
 
+export async function recognizeCardRankFromImageBytes(bytes: Uint8Array): Promise<RankRecognitionResult> {
+  const { data, info } = await sharp(bytes)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const features = extractRankColorFeaturesFromRgba(data, info.width, info.height);
+  const rank = classifyRankByColorFeatures(features);
+
+  return { rank, features };
+}
+
 function classifyRankByColorFeatures(features: RankColorFeatures): CardRank {
   const { hue, saturation, lightness, coloredPixelRatio } = features;
 
@@ -144,6 +159,83 @@ function classifyRankByColorFeatures(features: RankColorFeatures): CardRank {
   }
 
   return "unknown";
+}
+
+function extractRankColorFeaturesFromRgba(
+  imageData: Uint8Array,
+  imageWidth: number,
+  imageHeight: number,
+): RankColorFeatures {
+  const cropWidth = Math.max(1, Math.round(imageWidth * 0.16));
+  const cropHeight = Math.max(1, Math.min(imageHeight, Math.round(imageWidth * 0.12)));
+  let hueX = 0;
+  let hueY = 0;
+  let saturationSum = 0;
+  let lightnessSum = 0;
+  let coloredPixelCount = 0;
+  const totalPixelCount = cropWidth * cropHeight;
+
+  for (let y = 0; y < cropHeight; y += 1) {
+    for (let x = 0; x < cropWidth; x += 1) {
+      const index = (y * imageWidth + x) * 4;
+      const r = imageData[index] / 255;
+      const g = imageData[index + 1] / 255;
+      const b = imageData[index + 2] / 255;
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      let hue = 0;
+      let saturation = 0;
+      const lightness = (max + min) / 2;
+
+      if (max !== min) {
+        const delta = max - min;
+        saturation = lightness > 0.5 ? delta / (2 - max - min) : delta / (max + min);
+
+        switch (max) {
+          case r:
+            hue = (g - b) / delta + (g < b ? 6 : 0);
+            break;
+          case g:
+            hue = (b - r) / delta + 2;
+            break;
+          case b:
+            hue = (r - g) / delta + 4;
+            break;
+        }
+
+        hue /= 6;
+      }
+
+      if (saturation <= 0.2 || lightness <= 0.08 || lightness >= 0.85) {
+        continue;
+      }
+
+      const angle = hue * 2 * Math.PI;
+      hueX += Math.cos(angle);
+      hueY += Math.sin(angle);
+      saturationSum += saturation;
+      lightnessSum += lightness;
+      coloredPixelCount += 1;
+    }
+  }
+
+  if (coloredPixelCount === 0) {
+    return {
+      hue: 0,
+      saturation: 0,
+      lightness: 0,
+      coloredPixelRatio: 0,
+    };
+  }
+
+  const hue = (Math.atan2(hueY, hueX) / (2 * Math.PI) + 1) % 1;
+
+  return {
+    hue,
+    saturation: saturationSum / coloredPixelCount,
+    lightness: lightnessSum / coloredPixelCount,
+    coloredPixelRatio: coloredPixelCount / totalPixelCount,
+  };
 }
 
 async function extractRankColorFeatures(page: Page, imageUrl: string): Promise<RankColorFeatures> {

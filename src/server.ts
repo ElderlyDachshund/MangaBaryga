@@ -181,6 +181,7 @@ async function startBot(db: AppDatabase): Promise<void> {
   runtime.lastError = undefined;
 
   void runVisibleTradesLoop(db, settings, {
+    getSettings: () => loadRuntimeSettings(db),
     signal: botAbortController.signal,
     onPass: (result) => {
       runtime.lastPass = result;

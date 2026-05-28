@@ -16,6 +16,7 @@
     "scan-trades": "tsx src/index.ts scan-trades",
     "serve": "tsx src/index.ts serve",
     "start": "node dist/index.js serve",
+    "test": "node --import tsx --test \"tests/**/*.test.ts\"",
     "verify-ranks": "tsx src/index.ts verify-ranks",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx src/index.ts"
@@ -26,7 +27,8 @@
     "dotenv": "^16.5.0",
     "grammy": "^1.43.0",
     "hono": "^4.12.23",
-    "playwright": "^1.52.0"
+    "playwright": "^1.52.0",
+    "sharp": "^0.34.5"
   },
   "devDependencies": {
     "@playwright/test": "^1.52.0",
@@ -45,8 +47,8 @@
     "lucide-react": "^1.16.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
-    "tailwindcss": "^4.3.0",
     "tailwind-merge": "^3.6.0",
+    "tailwindcss": "^4.3.0",
     "tsx": "^4.19.0",
     "typescript": "^5.8.0",
     "vite": "^6.4.2",

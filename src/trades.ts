@@ -19,13 +19,25 @@ import {
   openSavedMangabuffSession,
   type BrowserSession,
 } from "./browser.js";
+import {
+  openSavedMangabuffHttpSession,
+  type MangabuffSessionClient,
+  type MangabuffTextResponse,
+} from "./mangabuff-http.js";
 import type { BotSettings, CardRank } from "./domain.js";
 import { isFinalTradeStatus, type TradeCard, type TradeRecord } from "./domain.js";
-import { isSupportedCardRank, recognizeCardPageRank } from "./ranks.js";
+import {
+  isSupportedCardRank,
+  recognizeCardPageRank,
+  recognizeCardRankFromImage,
+  recognizeCardRankFromImageBytes,
+} from "./ranks.js";
 import { passesDefaultRankRule, passesWantedPagesRule } from "./rules.js";
 import { sendAuthRequiredNotification, sendTradeProblemNotification } from "./telegram.js";
 
-const tradePassTimeoutMs = 45_000;
+const tradePassTimeoutMs = readIntegerEnv("MANGABUFF_TRADE_PASS_TIMEOUT_MS", 600_000, 45_000, 3_600_000);
+const tradePauseMinMs = readIntegerEnv("MANGABUFF_TRADE_PAUSE_MIN_MS", 6_000, 0, 60_000);
+const tradePauseMaxMs = readIntegerEnv("MANGABUFF_TRADE_PAUSE_MAX_MS", 10_000, 0, 60_000);
 
 export interface VisibleTrade {
   tradeId: string;
@@ -50,9 +62,12 @@ export interface ScanTradesResult {
 }
 
 export interface TradesLoopOptions {
+  getSettings?: () => BotSettings;
   signal?: AbortSignal;
   onPass?: (result: TradesPassResult) => void;
 }
+
+export type BotSettingsSource = BotSettings | (() => BotSettings);
 
 export type TradesPassResult =
   | (ScanTradesResult & {
@@ -74,18 +89,16 @@ export async function scanVisibleTrades(
   db: AppDatabase,
   settings: BotSettings,
 ): Promise<ScanTradesResult> {
-  const session = await openSavedMangabuffSession(settings);
+  const session = await openSavedMangabuffHttpSession();
 
   try {
-    return await scanVisibleTradesInSession(db, session, settings);
+    return await scanVisibleTradesInHttpSession(db, session, settings);
   } catch (error) {
     if (formatError(error) === "Нужна авторизация Mangabuff.") {
       await sendAuthRequiredNotification(settings);
     }
 
     throw error;
-  } finally {
-    await session.browser.close();
   }
 }
 
@@ -94,41 +107,34 @@ export async function runVisibleTradesLoop(
   settings: BotSettings,
   options: TradesLoopOptions = {},
 ): Promise<void> {
-  let session: BrowserSession | undefined;
+  const session = await openSavedMangabuffHttpSession();
+  const settingsSource = options.getSettings ?? (() => settings);
   let passNumber = 0;
 
-  try {
-    while (!options.signal?.aborted) {
-      session ??= await openSavedMangabuffSession(settings);
-      passNumber += 1;
-      const result = await runTradesPassWithTimeout(db, session, settings, passNumber);
-      options.onPass?.(result);
+  while (!options.signal?.aborted) {
+    passNumber += 1;
+    const result = await runTradesPassWithTimeout(db, session, settingsSource, passNumber);
+    options.onPass?.(result);
 
-      if (result.status === "auth_required") {
-        await sendAuthRequiredNotification(settings);
-        break;
-      }
+    const currentSettings = resolveBotSettings(settingsSource);
 
-      if (result.status === "temporary_error" && shouldReopenBrowserSession(result.reason)) {
-        await closeBrowserSession(session);
-        session = undefined;
-      }
-
-      await waitForNextPass(settings.loopPauseMs, options.signal);
+    if (result.status === "auth_required") {
+      await sendAuthRequiredNotification(currentSettings);
+      break;
     }
-  } finally {
-    await closeBrowserSession(session);
+
+    await waitForNextPass(currentSettings.loopPauseMs, options.signal);
   }
 }
 
 async function runTradesPass(
   db: AppDatabase,
-  session: BrowserSession,
-  settings: BotSettings,
+  session: MangabuffSessionClient,
+  settings: BotSettingsSource,
   passNumber: number,
 ): Promise<TradesPassResult> {
   try {
-    const scanResult = await scanVisibleTradesInSession(db, session, settings);
+    const scanResult = await scanVisibleTradesInHttpSession(db, session, settings);
     return { status: "ok", passNumber, ...scanResult };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
@@ -143,19 +149,18 @@ async function runTradesPass(
 
 async function runTradesPassWithTimeout(
   db: AppDatabase,
-  session: BrowserSession,
-  settings: BotSettings,
+  session: MangabuffSessionClient,
+  settings: BotSettingsSource,
   passNumber: number,
 ): Promise<TradesPassResult> {
   let timeout: NodeJS.Timeout | undefined;
 
   const timeoutResult = new Promise<TradesPassResult>((resolve) => {
     timeout = setTimeout(() => {
-      void closeBrowserSession(session);
       resolve({
         status: "temporary_error",
         passNumber,
-        reason: `Проход проверки завис дольше ${tradePassTimeoutMs / 1_000} секунд; браузерная сессия перезапущена.`,
+        reason: `HTTP-проход проверки завис дольше ${tradePassTimeoutMs / 1_000} секунд.`,
       });
     }, tradePassTimeoutMs);
   });
@@ -181,10 +186,81 @@ function shouldReopenBrowserSession(reason: string): boolean {
   );
 }
 
+export async function scanVisibleTradesInHttpSession(
+  db: AppDatabase,
+  session: MangabuffSessionClient,
+  settings: BotSettingsSource,
+): Promise<ScanTradesResult> {
+  const tradesPage = await session.getText(mangabuffTradesUrl);
+
+  if (tradesPage.status === 505 || htmlToText(tradesPage.text)?.includes("505")) {
+    throw new Error("Mangabuff вернул ошибку 505 при загрузке вкладки предложений.");
+  }
+
+  if (!isMangabuffAuthorizedHttp(tradesPage)) {
+    throw new Error("Нужна авторизация Mangabuff.");
+  }
+
+  const visibleTrades = extractVisibleTradeLinksFromHtml(tradesPage.text);
+  let insertedCount = 0;
+
+  for (const trade of visibleTrades) {
+    if (insertNewTrade(db, trade.tradeId, trade.tradeUrl)) {
+      insertedCount += 1;
+    }
+  }
+
+  const staleCount = markMissingTradesAsStale(
+    db,
+    visibleTrades.map((trade) => trade.tradeId),
+  );
+  const processingStats = {
+    processedCount: 0,
+    parsedCount: 0,
+    manualReviewCount: 0,
+    checkErrorCount: 0,
+    pageStaleCount: 0,
+    pagesCheckedCount: 0,
+    rulesDroppedCount: 0,
+    ranksCheckedCount: 0,
+    safeAcceptCount: 0,
+    acceptedCount: 0,
+    skippedCount: 0,
+  };
+
+  for (const [index, trade] of visibleTrades.entries()) {
+    const tradeSettings = resolveBotSettings(settings);
+    const result = await processVisibleTradeHttp(db, session, trade, tradeSettings);
+    const notificationSettings = resolveBotSettings(settings);
+
+    await sendProblemNotificationIfNeeded(db, notificationSettings, trade.tradeId);
+
+    processingStats.processedCount += result.processed ? 1 : 0;
+    processingStats.parsedCount += isParsedTradeOutcome(result.outcome) ? 1 : 0;
+    processingStats.manualReviewCount += isManualReviewOutcome(result.outcome) ? 1 : 0;
+    processingStats.checkErrorCount += result.outcome === "check_error" ? 1 : 0;
+    processingStats.pageStaleCount += result.outcome === "stale" ? 1 : 0;
+    processingStats.pagesCheckedCount += result.pagesChecked ? 1 : 0;
+    processingStats.rulesDroppedCount += result.outcome === "rules_dropped" ? 1 : 0;
+    processingStats.ranksCheckedCount += result.ranksChecked ? 1 : 0;
+    processingStats.safeAcceptCount += result.outcome === "safe_accept" ? 1 : 0;
+    processingStats.acceptedCount += result.outcome === "accepted" ? 1 : 0;
+    processingStats.skippedCount += result.outcome === "skipped" ? 1 : 0;
+
+    const nextTradeSettings = resolveBotSettings(settings);
+
+    if (result.processed && hasLaterProcessableTrade(db, visibleTrades, index, nextTradeSettings, false)) {
+      await waitBetweenTrades();
+    }
+  }
+
+  return { visibleTrades, insertedCount, staleCount, ...processingStats };
+}
+
 async function scanVisibleTradesInSession(
   db: AppDatabase,
   session: BrowserSession,
-  settings: BotSettings,
+  settings: BotSettingsSource,
 ): Promise<ScanTradesResult> {
   await openTradesPage(session.page);
 
@@ -220,9 +296,12 @@ async function scanVisibleTradesInSession(
     skippedCount: 0,
   };
 
-  for (const trade of visibleTrades) {
-    const result = await processVisibleTrade(db, session.page, trade, settings);
-    await sendProblemNotificationIfNeeded(db, settings, trade.tradeId);
+  for (const [index, trade] of visibleTrades.entries()) {
+    const tradeSettings = resolveBotSettings(settings);
+    const result = await processVisibleTrade(db, session.page, trade, tradeSettings);
+    const notificationSettings = resolveBotSettings(settings);
+
+    await sendProblemNotificationIfNeeded(db, notificationSettings, trade.tradeId);
 
     processingStats.processedCount += result.processed ? 1 : 0;
     processingStats.parsedCount += isParsedTradeOutcome(result.outcome) ? 1 : 0;
@@ -235,9 +314,19 @@ async function scanVisibleTradesInSession(
     processingStats.safeAcceptCount += result.outcome === "safe_accept" ? 1 : 0;
     processingStats.acceptedCount += result.outcome === "accepted" ? 1 : 0;
     processingStats.skippedCount += result.outcome === "skipped" ? 1 : 0;
+
+    const nextTradeSettings = resolveBotSettings(settings);
+
+    if (result.processed && hasLaterProcessableTrade(db, visibleTrades, index, nextTradeSettings, true)) {
+      await waitBetweenTrades();
+    }
   }
 
   return { visibleTrades, insertedCount, staleCount, ...processingStats };
+}
+
+function resolveBotSettings(settings: BotSettingsSource): BotSettings {
+  return typeof settings === "function" ? settings() : settings;
 }
 
 type ProcessTradeOutcome =
@@ -278,6 +367,142 @@ interface ParsedTradePage {
   offeredCards: TradeCard[];
 }
 
+async function processVisibleTradeHttp(
+  db: AppDatabase,
+  session: MangabuffSessionClient,
+  trade: VisibleTrade,
+  settings: BotSettings,
+): Promise<ProcessTradeResult> {
+  const record = findTradeById(db, trade.tradeId);
+
+  if (!shouldProcessTrade(record, settings, false)) {
+    return { processed: false, outcome: "skipped" };
+  }
+
+  try {
+    if (record?.status === "принят" && record.acceptAttempts >= 2) {
+      const reason = "Обмен снова появился во вкладке предложений после двух попыток принятия.";
+      updateTradeStatus(db, trade.tradeId, "требует_ручной_проверки", reason);
+      return { processed: true, outcome: "manual_review" };
+    }
+
+    const tradePage = await session.getText(trade.tradeUrl);
+    const pageState = getTradePageStateFromHtml(tradePage);
+
+    if (pageState === "not_found") {
+      const status = recordTradeCheckFailure(
+        db,
+        trade.tradeId,
+        "Страница обмена недоступна или показывает 404.",
+      );
+      return { processed: true, outcome: status === "ошибка_проверки" ? "check_error" : "manual_review" };
+    }
+
+    if (pageState === "cancelled") {
+      updateTradeStatus(db, trade.tradeId, "неактуален", "Обмен отменен на сайте.");
+      return { processed: true, outcome: "stale" };
+    }
+
+    if (pageState === "accepted") {
+      if ((record?.acceptAttempts ?? 0) > 0) {
+        updateTradeStatus(db, trade.tradeId, "принят", "Сайт показывает, что обмен принят этим ботом.");
+        return { processed: true, outcome: "accepted" };
+      }
+
+      updateTradeStatus(db, trade.tradeId, "неактуален", "Обмен уже принят не этим ботом.");
+      return { processed: true, outcome: "stale" };
+    }
+
+    const parsedTrade = parseActiveTradePageFromHtml(tradePage.text);
+    validateParsedTrade(parsedTrade);
+
+    if (parsedTrade.requestedCards.length > 1) {
+      const reason = `В обмене хотят забрать больше одной карты: ${parsedTrade.requestedCards.length}.`;
+      updateTradeParsedData(db, trade.tradeId, { ...parsedTrade, reason });
+      updateTradeStatus(db, trade.tradeId, "требует_ручной_проверки", reason);
+      return { processed: true, outcome: "manual_review" };
+    }
+
+    updateTradeParsedData(db, trade.tradeId, {
+      ...parsedTrade,
+      reason: "Состав обмена разобран.",
+    });
+
+    const requestedCard = parsedTrade.requestedCards[0];
+    const wantedPagesCount = await countWantedPagesForRequestedCardHttp(session, requestedCard);
+
+    if (!passesWantedPagesRule(wantedPagesCount, settings.maxWantedPagesExclusive)) {
+      const ruleReason =
+        `У запрошенной карты ${wantedPagesCount} страниц желающих. ` +
+        `Правило требует меньше ${settings.maxWantedPagesExclusive}.`;
+      const decision = getRuleFailureDecision(settings, ruleReason);
+
+      updateTradeWantedPagesCount(db, trade.tradeId, wantedPagesCount, decision.reason);
+      updateTradeStatus(db, trade.tradeId, decision.status, decision.reason);
+      return { processed: true, outcome: decision.outcome, pagesChecked: true };
+    }
+
+    const rankedTrade = await recognizeTradeRanksHttp(session, parsedTrade);
+    const requestedRank = rankedTrade.requestedCards[0].rank;
+    const offeredRanks = rankedTrade.offeredCards.map((card) => card.rank);
+    const recognizedOfferedRanks = offeredRanks.filter((rank): rank is CardRank => Boolean(rank));
+
+    if (!requestedRank || recognizedOfferedRanks.length !== offeredRanks.length) {
+      throw new Error("не удалось определить ранги всех карт обмена");
+    }
+
+    const rankSummary = formatRankSummary(requestedRank, recognizedOfferedRanks);
+
+    updateTradeParsedData(db, trade.tradeId, {
+      ...rankedTrade,
+      reason: `Ранги карт распознаны: ${rankSummary}.`,
+    });
+
+    const supportedRequestedRank = isSupportedCardRank(requestedRank) ? requestedRank : undefined;
+    const supportedOfferedRanks = recognizedOfferedRanks.filter(isSupportedCardRank);
+
+    if (!supportedRequestedRank || supportedOfferedRanks.length !== recognizedOfferedRanks.length) {
+      const reason = `В обмене есть неизвестный тип ранга: ${rankSummary}.`;
+
+      updateTradeStatus(db, trade.tradeId, "требует_ручной_проверки", reason);
+      return { processed: true, outcome: "manual_review", pagesChecked: true, ranksChecked: true };
+    }
+
+    if (!passesDefaultRankRule(supportedRequestedRank, supportedOfferedRanks)) {
+      const ruleReason = `Ранговое правило не выполнено: ${rankSummary}.`;
+      const decision = getRuleFailureDecision(settings, ruleReason);
+
+      updateTradeRankRuleResult(db, trade.tradeId, "не_выполнено", ruleReason);
+      updateTradeWantedPagesCount(db, trade.tradeId, wantedPagesCount, decision.reason);
+      updateTradeStatus(db, trade.tradeId, decision.status, decision.reason);
+      return { processed: true, outcome: decision.outcome, pagesChecked: true, ranksChecked: true };
+    }
+
+    const reason =
+      `Бот бы принял обмен: у запрошенной карты ${wantedPagesCount} страниц желающих, ` +
+      `ранговое правило выполнено (${rankSummary}).`;
+
+    updateTradeRankRuleResult(db, trade.tradeId, "выполнено", reason);
+    updateTradeWantedPagesCount(db, trade.tradeId, wantedPagesCount, reason);
+
+    if (!settings.safeMode && settings.autoAcceptEnabled) {
+      return await acceptTradeAfterRulesPassHttp(db, session, trade, record, reason);
+    }
+
+    updateTradeStatus(db, trade.tradeId, "бот_бы_принял", reason);
+
+    return { processed: true, outcome: "safe_accept", pagesChecked: true, ranksChecked: true };
+  } catch (error) {
+    const status = recordTradeCheckFailure(
+      db,
+      trade.tradeId,
+      `Не удалось разобрать страницу обмена: ${formatError(error)}`,
+    );
+
+    return { processed: true, outcome: status === "ошибка_проверки" ? "check_error" : "manual_review" };
+  }
+}
+
 async function processVisibleTrade(
   db: AppDatabase,
   page: Page,
@@ -286,7 +511,7 @@ async function processVisibleTrade(
 ): Promise<ProcessTradeResult> {
   const record = findTradeById(db, trade.tradeId);
 
-  if (!shouldProcessTrade(record, settings)) {
+  if (!shouldProcessTrade(record, settings, true)) {
     return { processed: false, outcome: "skipped" };
   }
 
@@ -484,6 +709,91 @@ async function acceptTradeAfterRulesPass(
   };
 }
 
+async function acceptTradeAfterRulesPassHttp(
+  db: AppDatabase,
+  session: MangabuffSessionClient,
+  trade: VisibleTrade,
+  record: TradeRecord | undefined,
+  ruleReason: string,
+): Promise<ProcessTradeResult> {
+  if ((record?.acceptAttempts ?? 0) >= 2) {
+    const reason = `Исчерпаны 2 попытки принятия. ${ruleReason}`;
+    updateTradeStatus(db, trade.tradeId, "требует_ручной_проверки", reason);
+    return { processed: true, outcome: "manual_review", pagesChecked: true, ranksChecked: true };
+  }
+
+  const tradePage = await session.getText(trade.tradeUrl);
+  const pageState = getTradePageStateFromHtml(tradePage);
+
+  if (pageState === "not_found") {
+    const status = recordTradeCheckFailure(
+      db,
+      trade.tradeId,
+      "Страница обмена недоступна перед принятием.",
+    );
+    return {
+      processed: true,
+      outcome: status === "ошибка_проверки" ? "check_error" : "manual_review",
+      pagesChecked: true,
+      ranksChecked: true,
+    };
+  }
+
+  if (pageState === "cancelled") {
+    updateTradeStatus(db, trade.tradeId, "неактуален", "Обмен отменен на сайте перед принятием.");
+    return { processed: true, outcome: "stale", pagesChecked: true, ranksChecked: true };
+  }
+
+  if (pageState === "accepted") {
+    updateTradeStatus(db, trade.tradeId, "неактуален", "Обмен уже принят до HTTP-принятия этого бота.");
+    return { processed: true, outcome: "stale", pagesChecked: true, ranksChecked: true };
+  }
+
+  if (!hasAcceptTradeButton(tradePage.text)) {
+    throw new Error('не удалось найти кнопку "Принять обмен"');
+  }
+
+  const csrfToken = readCsrfTokenFromHtml(tradePage.text);
+
+  if (!csrfToken) {
+    throw new Error("не удалось найти CSRF-токен для принятия обмена");
+  }
+
+  recordTradeAcceptAttempt(db, trade.tradeId);
+
+  const acceptResponse = await session.postJson(
+    `https://mangabuff.ru/trades/${trade.tradeId}/accept`,
+    {},
+    {
+      csrfToken,
+      referer: tradePage.url,
+    },
+  );
+
+  if (!acceptResponse.ok) {
+    throw new Error(`сайт отклонил HTTP-принятие обмена: ${formatHttpJsonError(acceptResponse.status, acceptResponse.json)}`);
+  }
+
+  if (await waitForAcceptedTradeStateHttp(session, trade.tradeUrl)) {
+    const reason = ruleReason.replace("Бот бы принял обмен", "Бот принял обмен");
+    updateTradeStatus(db, trade.tradeId, "принят", reason);
+    return { processed: true, outcome: "accepted", pagesChecked: true, ranksChecked: true };
+  }
+
+  const status = recordTradeCheckFailure(
+    db,
+    trade.tradeId,
+    "Бот отправил HTTP-принятие, но сайт не показал статус `Обмен принят`.",
+  );
+
+  return {
+    processed: true,
+    outcome: status === "ошибка_проверки" ? "check_error" : "manual_review",
+    pagesChecked: true,
+    ranksChecked: true,
+  };
+}
+
 async function confirmAcceptIfNeeded(page: Page): Promise<void> {
   const confirmButton = page
     .locator('[role="dialog"] button, .modal button, [class*="modal"] button, [class*="Modal"] button')
@@ -505,6 +815,14 @@ async function waitForAcceptedTradeState(page: Page, tradeUrl: string): Promise<
 
   await openTradePage(page, tradeUrl);
   return hasAcceptedTradeText(page);
+}
+
+async function waitForAcceptedTradeStateHttp(
+  session: MangabuffSessionClient,
+  tradeUrl: string,
+): Promise<boolean> {
+  const tradePage = await session.getText(tradeUrl);
+  return getTradePageStateFromHtml(tradePage) === "accepted";
 }
 
 async function hasAcceptedTradeText(page: Page): Promise<boolean> {
@@ -543,28 +861,86 @@ async function recognizeTradeRanks(page: Page, parsedTrade: ParsedTradePage): Pr
   };
 }
 
+async function recognizeTradeRanksHttp(
+  session: MangabuffSessionClient,
+  parsedTrade: ParsedTradePage,
+): Promise<ParsedTradePage> {
+  return {
+    senderName: parsedTrade.senderName,
+    requestedCards: await recognizeCardsRanksHttp(session, parsedTrade.requestedCards),
+    offeredCards: await recognizeCardsRanksHttp(session, parsedTrade.offeredCards),
+  };
+}
+
 async function recognizeCardsRanks(page: Page, cards: TradeCard[]): Promise<TradeCard[]> {
   const rankedCards: TradeCard[] = [];
 
   for (const card of cards) {
-    const recognition = await recognizeCardPageRank(page, card.url);
+    const recognition = card.imageUrl
+      ? await recognizeCardRankFromImage(page, card.imageUrl)
+      : await recognizeCardPageRank(page, card.url);
     rankedCards.push({ ...card, rank: recognition.rank });
   }
 
   return rankedCards;
 }
 
+async function recognizeCardsRanksHttp(
+  session: MangabuffSessionClient,
+  cards: TradeCard[],
+): Promise<TradeCard[]> {
+  const rankedCards: TradeCard[] = [];
+
+  for (const card of cards) {
+    const imageUrl = card.imageUrl ?? (await findCardImageUrlHttp(session, card.url));
+    const response = await session.getBytes(imageUrl);
+
+    if (!response.ok) {
+      throw new Error(`не удалось загрузить изображение карты ${card.cardId}: HTTP ${response.status}`);
+    }
+
+    const recognition = await recognizeCardRankFromImageBytes(response.bytes);
+    rankedCards.push({ ...card, imageUrl, rank: recognition.rank });
+  }
+
+  return rankedCards;
+}
+
+async function findCardImageUrlHttp(session: MangabuffSessionClient, cardUrl: string): Promise<string> {
+  const response = await session.getText(cardUrl);
+
+  if (!response.ok) {
+    throw new Error(`не удалось открыть страницу карты ${cardUrl}: HTTP ${response.status}`);
+  }
+
+  const imageUrl = findFirstCardImageUrl(response.text);
+
+  if (!imageUrl) {
+    throw new Error(`Не удалось найти изображение карты на странице ${cardUrl}.`);
+  }
+
+  return imageUrl;
+}
+
 function formatRankSummary(requestedRank: CardRank, offeredRanks: CardRank[]): string {
   return `запрошена ${requestedRank}, предлагают ${offeredRanks.join(", ")}`;
 }
 
-function shouldProcessTrade(record: TradeRecord | undefined, settings: BotSettings): boolean {
+function shouldProcessTrade(
+  record: TradeRecord | undefined,
+  settings: BotSettings,
+  canAcceptTrades: boolean,
+): boolean {
   if (!record) {
     return true;
   }
 
+  if (shouldRecheckLegacyWantedPagesRecord(record)) {
+    return true;
+  }
+
   if (record.status === "бот_бы_принял") {
-    return !settings.safeMode && settings.autoAcceptEnabled;
+    return canAcceptTrades && !settings.safeMode && settings.autoAcceptEnabled;
   }
 
   if (record.status === "принят") {
@@ -580,6 +956,26 @@ function shouldProcessTrade(record: TradeRecord | undefined, settings: BotSettin
   }
 
   return record.status === "новое";
+}
+
+function shouldRecheckLegacyWantedPagesRecord(record: TradeRecord): boolean {
+  if (!["бот_бы_принял", "брошен_по_правилам", "требует_ручной_проверки"].includes(record.status)) {
+    return false;
+  }
+
+  return [...record.requestedCards, ...record.offeredCards].some((card) => /\/cards\/[^/?#]+\/users(?:[?#]|$)/.test(card.url));
+}
+
+function hasLaterProcessableTrade(
+  db: AppDatabase,
+  visibleTrades: VisibleTrade[],
+  currentIndex: number,
+  settings: BotSettings,
+  canAcceptTrades: boolean,
+): boolean {
+  return visibleTrades
+    .slice(currentIndex + 1)
+    .some((trade) => shouldProcessTrade(findTradeById(db, trade.tradeId), settings, canAcceptTrades));
 }
 
 async function sendProblemNotificationIfNeeded(
@@ -606,9 +1002,30 @@ async function countWantedPagesForRequestedCard(page: Page, requestedCard: Trade
   return countWantedUsersPagesFromHtml(html);
 }
 
-async function fetchWantedUsersPageHtml(page: Page, requestedCard: TradeCard): Promise<string> {
+async function countWantedPagesForRequestedCardHttp(
+  session: MangabuffSessionClient,
+  requestedCard: TradeCard,
+): Promise<number> {
+  const wantedUsersUrl = buildWantedOffersUrl(requestedCard.cardId);
+
   try {
-    const response = await page.context().request.get(requestedCard.url, { timeout: 20_000 });
+    const response = await session.getText(wantedUsersUrl);
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    return countWantedUsersPagesFromHtml(response.text);
+  } catch (error) {
+    throw new Error(`не удалось открыть страницу запрошенной карты ${requestedCard.cardId}: ${formatError(error)}`);
+  }
+}
+
+async function fetchWantedUsersPageHtml(page: Page, requestedCard: TradeCard): Promise<string> {
+  const wantedUsersUrl = buildWantedOffersUrl(requestedCard.cardId);
+
+  try {
+    const response = await page.context().request.get(wantedUsersUrl, { timeout: 20_000 });
 
     if (!response.ok()) {
       throw new Error(`HTTP ${response.status()}`);
@@ -641,15 +1058,44 @@ function countWantedUsersPagesFromHtml(html: string): number {
 }
 
 function readPaginationPagesCountFromHtml(html: string): number | undefined {
-  const pageNumbers = [...html.matchAll(/[?&]page=(\d+)/g)]
-    .map((match) => Number(match[1]))
-    .filter((pageNumber) => Number.isInteger(pageNumber) && pageNumber > 0);
+  const pageNumbers = [...html.matchAll(/\bhref\s*=\s*(["'])(.*?)\1/gis)]
+    .map((match) => readPageNumberFromHref(match[2]))
+    .filter((pageNumber): pageNumber is number => pageNumber !== undefined);
 
   if (pageNumbers.length === 0) {
     return undefined;
   }
 
   return Math.max(...pageNumbers);
+}
+
+function readPageNumberFromHref(href: string): number | undefined {
+  const decodedHref = decodeHtmlAttributeValue(href);
+
+  try {
+    const url = new URL(decodedHref, "https://mangabuff.ru");
+    const pageNumber = Number(url.searchParams.get("page"));
+
+    if (Number.isInteger(pageNumber) && pageNumber > 0) {
+      return pageNumber;
+    }
+  } catch {
+    const pageMatch = decodedHref.match(/[?&]page=(\d+)/);
+    const pageNumber = pageMatch ? Number(pageMatch[1]) : NaN;
+
+    if (Number.isInteger(pageNumber) && pageNumber > 0) {
+      return pageNumber;
+    }
+  }
+
+  return undefined;
+}
+
+function decodeHtmlAttributeValue(value: string): string {
+  return value
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0*39;|&apos;/gi, "'");
 }
 
 function htmlToText(html: string): string {
@@ -799,6 +1245,130 @@ async function hasVisibleWantedUsers(page: Page): Promise<boolean> {
   return userLinksCount > 0;
 }
 
+function isMangabuffAuthorizedHttp(response: MangabuffTextResponse): boolean {
+  const url = new URL(response.url);
+  const text = htmlToText(response.text);
+
+  if (url.pathname.includes("login") || url.pathname.includes("auth")) {
+    return false;
+  }
+
+  if (text.includes("предложения") || text.includes("отправленные")) {
+    return true;
+  }
+
+  return !text.includes("войти") && !text.includes("авторизация");
+}
+
+function getTradePageStateFromHtml(
+  response: MangabuffTextResponse,
+): "active" | "cancelled" | "accepted" | "not_found" {
+  const bodyText = htmlFragmentToText(response.text);
+
+  if (
+    response.status === 404 ||
+    bodyText.includes("Страница не найдена") ||
+    /\/404(?:$|[/?#])/.test(response.url)
+  ) {
+    return "not_found";
+  }
+
+  if (bodyText.includes("Обмен отменен")) {
+    return "cancelled";
+  }
+
+  if (bodyText.includes("Обмен принят")) {
+    return "accepted";
+  }
+
+  return "active";
+}
+
+function parseActiveTradePageFromHtml(html: string): ParsedTradePage {
+  const trade = findElementByClass(html, "trade");
+
+  if (!trade) {
+    throw new Error("не удалось найти блок обмена на странице");
+  }
+
+  return {
+    senderName: readSenderNameFromHtml(trade.html),
+    offeredCards: readCardsFromHtml(findElementByClass(trade.html, "trade__main-items--creator")?.html ?? ""),
+    requestedCards: readCardsFromHtml(findElementByClass(trade.html, "trade__main-items--receiver")?.html ?? ""),
+  };
+}
+
+function readSenderNameFromHtml(tradeHtml: string): string | undefined {
+  const header = findElementByClass(tradeHtml, "trade__header")?.html;
+
+  if (!header) {
+    return undefined;
+  }
+
+  const nameLink = findElementByClass(header, "trade__header-name")?.html;
+  const linkText = normalizeText(htmlFragmentToText(nameLink));
+
+  if (linkText) {
+    return linkText;
+  }
+
+  return normalizeText(htmlFragmentToText(header).split("предлагает обмен")[0]);
+}
+
+function hasAcceptTradeButton(html: string): boolean {
+  return /<button\b[^>]*class=["'][^"']*\btrade__accepted-btn\b[^"']*["'][^>]*>/i.test(html);
+}
+
+function readCsrfTokenFromHtml(html: string): string | undefined {
+  for (const metaTag of html.match(/<meta\b[^>]*>/gi) ?? []) {
+    if (readHtmlAttribute(metaTag, "name") === "csrf-token") {
+      return readHtmlAttribute(metaTag, "content");
+    }
+  }
+
+  return undefined;
+}
+
+function readCardsFromHtml(sectionHtml: string): TradeCard[] {
+  const cards: TradeCard[] = [];
+
+  for (const linkHtml of sectionHtml.match(/<a\b[\s\S]*?<\/a>/gi) ?? []) {
+    const href = readHtmlAttribute(linkHtml, "href");
+
+    if (!href || !/\/cards\/[^/?#]+/.test(href)) {
+      continue;
+    }
+
+    const url = new URL(href, "https://mangabuff.ru").href;
+    const cardId = url.match(/\/cards\/([^/?#]+)/)?.[1] ?? "";
+    const imageTag = linkHtml.match(/<img\b[^>]*>/i)?.[0];
+    const imageSrc = imageTag ? readHtmlAttribute(imageTag, "src") : undefined;
+    const imageTitle = normalizeCardTitle(imageTag ? readHtmlAttribute(imageTag, "alt") : undefined);
+    const linkTitle = normalizeText(htmlFragmentToText(linkHtml));
+
+    cards.push({
+      cardId,
+      url: cardId ? buildWantedOffersUrl(cardId) : url,
+      imageUrl: imageSrc ? new URL(imageSrc, "https://mangabuff.ru").href : undefined,
+      title: imageTitle ?? linkTitle,
+    });
+  }
+
+  return cards;
+}
+
+function findFirstCardImageUrl(html: string): string | undefined {
+  for (const imageTag of html.match(/<img\b[^>]*>/gi) ?? []) {
+    const src = readHtmlAttribute(imageTag, "src");
+
+    if (src?.includes("/img/cards/")) {
+      return new URL(src, "https://mangabuff.ru").href;
+    }
+  }
+
+  return undefined;
+}
+
 async function openTradePage(page: Page, tradeUrl: string): Promise<void> {
   try {
     await page.goto(tradeUrl, { waitUntil: "domcontentloaded" });
@@ -863,17 +1433,23 @@ async function readCards(cardLinks: Locator): Promise<TradeCard[]> {
     const href = await cardLink.getAttribute("href");
     const url = href ? new URL(href, "https://mangabuff.ru").href : "";
     const cardId = url.match(/\/cards\/([^/?#]+)/)?.[1] ?? "";
+    const imageSrc = await cardLink.locator("img").first().getAttribute("src").catch(() => null);
     const imageTitle = normalizeText(await cardLink.locator("img").first().getAttribute("alt").catch(() => null));
     const linkTitle = normalizeText(await cardLink.innerText().catch(() => ""));
 
     cards.push({
       cardId,
-      url: cardId ? `https://mangabuff.ru/cards/${cardId}/users` : url,
+      url: cardId ? buildWantedOffersUrl(cardId) : url,
+      imageUrl: imageSrc ? new URL(imageSrc, "https://mangabuff.ru").href : undefined,
       title: imageTitle ?? linkTitle,
     });
   }
 
   return cards;
+}
+
+function buildWantedOffersUrl(cardId: string): string {
+  return `https://mangabuff.ru/cards/${cardId}/offers/want`;
 }
 
 function normalizeText(value: string | null | undefined): string | undefined {
@@ -952,6 +1528,21 @@ async function clickFirstVisible(locator: Locator): Promise<boolean> {
   return false;
 }
 
+function extractVisibleTradeLinksFromHtml(html: string): VisibleTrade[] {
+  const tradesById = new Map<string, VisibleTrade>();
+
+  for (const match of html.matchAll(/href=["']([^"']*\/trades\/(\d+)[^"']*)["']/gi)) {
+    const tradeId = match[2];
+
+    tradesById.set(tradeId, {
+      tradeId,
+      tradeUrl: `https://mangabuff.ru/trades/${tradeId}`,
+    });
+  }
+
+  return [...tradesById.values()];
+}
+
 async function extractVisibleTradeLinks(page: Page): Promise<VisibleTrade[]> {
   const hrefs = await page.locator("a[href^='/trades/'], a[href*='mangabuff.ru/trades/']").evaluateAll(
     (links) =>
@@ -979,6 +1570,103 @@ async function extractVisibleTradeLinks(page: Page): Promise<VisibleTrade[]> {
   return [...tradesById.values()];
 }
 
+interface HtmlElementMatch {
+  html: string;
+  start: number;
+  end: number;
+}
+
+function findElementByClass(html: string, className: string): HtmlElementMatch | undefined {
+  const openTagPattern = /<([a-z][\w-]*)\b[^>]*>/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = openTagPattern.exec(html))) {
+    const classAttribute = readHtmlAttribute(match[0], "class");
+
+    if (!classAttribute?.split(/\s+/).includes(className)) {
+      continue;
+    }
+
+    return readElementAt(html, match.index, match[1]);
+  }
+
+  return undefined;
+}
+
+function readElementAt(html: string, start: number, tagName: string): HtmlElementMatch {
+  const tagPattern = new RegExp(`</?${escapeRegExp(tagName)}\\b[^>]*>`, "gi");
+  tagPattern.lastIndex = start;
+  let depth = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = tagPattern.exec(html))) {
+    const tag = match[0];
+    const isClosingTag = tag.startsWith("</");
+    const isSelfClosingTag = tag.endsWith("/>");
+
+    if (isClosingTag) {
+      depth -= 1;
+    } else if (!isSelfClosingTag) {
+      depth += 1;
+    }
+
+    if (depth === 0) {
+      return {
+        html: html.slice(start, tagPattern.lastIndex),
+        start,
+        end: tagPattern.lastIndex,
+      };
+    }
+  }
+
+  return {
+    html: html.slice(start),
+    start,
+    end: html.length,
+  };
+}
+
+function readHtmlAttribute(tagHtml: string, name: string): string | undefined {
+  const match = tagHtml.match(new RegExp(`\\b${escapeRegExp(name)}\\s*=\\s*([\"'])([\\s\\S]*?)\\1`, "i"));
+  return match ? decodeHtmlEntities(match[2]) : undefined;
+}
+
+function htmlFragmentToText(html: string | undefined): string {
+  if (!html) {
+    return "";
+  }
+
+  return decodeHtmlEntities(
+    html
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
+}
+
+function normalizeCardTitle(value: string | undefined): string | undefined {
+  const title = normalizeText(value);
+  return title && title !== "Карточка" ? title : undefined;
+}
+
+function decodeHtmlEntities(value: string): string {
+  return value
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&#(\d+);/g, (_, code: string) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, code: string) => String.fromCodePoint(Number.parseInt(code, 16)));
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 async function waitForNextPass(loopPauseMs: number, signal?: AbortSignal): Promise<void> {
   try {
     await sleep(loopPauseMs, undefined, { signal });
@@ -989,6 +1677,53 @@ async function waitForNextPass(loopPauseMs: number, signal?: AbortSignal): Promi
   }
 }
 
+async function waitBetweenTrades(): Promise<void> {
+  await sleep(randomTradePauseMs());
+}
+
+function randomTradePauseMs(): number {
+  const minMs = Math.min(tradePauseMinMs, tradePauseMaxMs);
+  const maxMs = Math.max(tradePauseMinMs, tradePauseMaxMs);
+
+  return minMs + Math.floor(Math.random() * (maxMs - minMs + 1));
+}
+
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function formatHttpJsonError(status: number, body: unknown): string {
+  if (body && typeof body === "object") {
+    const source = body as Record<string, unknown>;
+
+    if (typeof source.message === "string") {
+      return `HTTP ${status}: ${source.message}`;
+    }
+
+    if (source.errors && typeof source.errors === "object") {
+      const firstError = Object.values(source.errors as Record<string, unknown>)[0];
+
+      if (Array.isArray(firstError) && typeof firstError[0] === "string") {
+        return `HTTP ${status}: ${firstError[0]}`;
+      }
+    }
+  }
+
+  return `HTTP ${status}`;
+}
+
+function readIntegerEnv(name: string, fallback: number, min: number, max: number): number {
+  const rawValue = process.env[name];
+
+  if (!rawValue) {
+    return fallback;
+  }
+
+  const value = Number(rawValue);
+
+  if (!Number.isInteger(value) || value < min || value > max) {
+    return fallback;
+  }
+
+  return value;
 }

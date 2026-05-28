@@ -2,6 +2,7 @@ import {
   CircleAlert,
   ExternalLink,
   KeyRound,
+  MousePointerClick,
   Play,
   RefreshCw,
   Save,
@@ -27,7 +28,6 @@ import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import { Label } from "./components/ui/label";
 import { Select } from "./components/ui/select";
-import { Switch } from "./components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
 
 interface SettingsForm {
@@ -40,6 +40,7 @@ interface SettingsForm {
   autoAcceptEnabled: boolean;
 }
 
+type TradeMode = "safe" | "auto";
 type Message = { kind: "notice" | "error"; text: string } | undefined;
 
 export function App() {
@@ -104,8 +105,22 @@ export function App() {
     });
   }
 
+  async function switchTradeMode(mode: TradeMode): Promise<void> {
+    await runAction(`switch-mode-${mode}`, async () => {
+      const nextSettings = await saveSettings(buildTradeModePatch(mode));
+
+      setSettingsForm((current) => mergeSettingsIntoForm(current, nextSettings));
+      setMessage({
+        kind: "notice",
+        text: mode === "auto" ? "Включён режим принятия обменов." : "Включён безопасный режим.",
+      });
+      await refreshState();
+    });
+  }
+
   const runtime = state?.runtime;
   const isBotRunning = Boolean(runtime?.running);
+  const currentTradeMode = state ? getTradeMode(state.settings) : getTradeMode(settingsForm);
 
   return (
     <div className="min-h-screen bg-[#f7f7f4] text-stone-950">
@@ -155,10 +170,16 @@ export function App() {
             </Button>
           </div>
 
-          <div className="mt-5 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
-            {state?.settings.autoAcceptEnabled && !state?.settings.safeMode
-              ? "Рабочий режим включён: бот принимает обмены, которые прошли правила."
-              : "Безопасный режим: бот проверяет обмены и пишет `бот бы принял` без клика принятия."}
+          <div className="mt-5 rounded-md border border-stone-200 bg-white p-3">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <h2 className="text-sm font-semibold">Режим обменов</h2>
+              <ModeBadge mode={currentTradeMode} />
+            </div>
+            <TradeModeControl
+              disabled={busyAction?.startsWith("switch-mode")}
+              mode={currentTradeMode}
+              onChange={(mode) => void switchTradeMode(mode)}
+            />
           </div>
 
           <section className="mt-5 border-t border-stone-200 pt-5">
@@ -301,39 +322,16 @@ export function App() {
                         <option value="headful">Видимый</option>
                       </Select>
                     </Field>
-                    <Field label="Автопринятие">
-                      <div className="flex h-9 items-center gap-3 rounded-md border border-stone-200 bg-white px-3">
-                        <Switch
-                          checked={settingsForm.autoAcceptEnabled}
-                          onCheckedChange={(checked) =>
-                            setSettingsForm((current) => ({
-                              ...current,
-                              autoAcceptEnabled: checked,
-                              safeMode: checked ? false : true,
-                            }))
-                          }
-                        />
-                        <span className="text-sm text-stone-600">
-                          {settingsForm.autoAcceptEnabled ? "Включено" : "Выключено"}
-                        </span>
-                      </div>
-                    </Field>
-                    <Field label="Только проверять">
-                      <div className="flex h-9 items-center gap-3 rounded-md border border-stone-200 bg-white px-3">
-                        <Switch
-                          checked={settingsForm.safeMode}
-                          onCheckedChange={(checked) =>
-                            setSettingsForm((current) => ({
-                              ...current,
-                              safeMode: checked,
-                              autoAcceptEnabled: checked ? false : current.autoAcceptEnabled,
-                            }))
-                          }
-                        />
-                        <span className="text-sm text-stone-600">
-                          {settingsForm.safeMode ? "Включено" : "Выключено"}
-                        </span>
-                      </div>
+                    <Field label="Режим обменов">
+                      <TradeModeControl
+                        mode={getTradeMode(settingsForm)}
+                        onChange={(mode) =>
+                          setSettingsForm((current) => ({
+                            ...current,
+                            ...buildTradeModePatch(mode),
+                          }))
+                        }
+                      />
                     </Field>
                     <Field label="Telegram bot token">
                       <Input
@@ -396,7 +394,7 @@ function TradesTable({ trades }: { trades: TradeRecord[] }) {
               <th className="px-3 py-3">Пользователь</th>
               <th className="px-3 py-3">Забирают</th>
               <th className="px-3 py-3">Предлагают</th>
-              <th className="px-3 py-3">Страницы</th>
+              <th className="px-3 py-3">Страницы желающих</th>
               <th className="px-3 py-3">Ранги</th>
               <th className="px-3 py-3">Причина</th>
               <th className="px-3 py-3">Обновлён</th>
@@ -473,6 +471,60 @@ function RuntimeBadge({ runtime }: { runtime: ApiState["runtime"] | undefined })
   return <Badge>Остановлен</Badge>;
 }
 
+function ModeBadge({ mode }: { mode: TradeMode }) {
+  if (mode === "auto") {
+    return (
+      <Badge variant="warn">
+        <MousePointerClick className="mr-1 size-3" />
+        Принимает
+      </Badge>
+    );
+  }
+
+  return (
+    <Badge variant="good">
+      <ShieldCheck className="mr-1 size-3" />
+      Анализ
+    </Badge>
+  );
+}
+
+function TradeModeControl({
+  disabled = false,
+  mode,
+  onChange,
+}: {
+  disabled?: boolean;
+  mode: TradeMode;
+  onChange: (mode: TradeMode) => void;
+}) {
+  return (
+    <div className="grid gap-2">
+      <Button
+        aria-pressed={mode === "safe"}
+        className={mode === "safe" ? "border-emerald-700 bg-emerald-700 hover:bg-emerald-800" : undefined}
+        disabled={disabled}
+        onClick={() => onChange("safe")}
+        type="button"
+        variant={mode === "safe" ? "default" : "outline"}
+      >
+        <ShieldCheck />
+        Только анализ
+      </Button>
+      <Button
+        aria-pressed={mode === "auto"}
+        disabled={disabled}
+        onClick={() => onChange("auto")}
+        type="button"
+        variant={mode === "auto" ? "destructive" : "outline"}
+      >
+        <MousePointerClick />
+        Принимать
+      </Button>
+    </div>
+  );
+}
+
 function StatusBadge({ status }: { status: TradeStatus }) {
   const variantByStatus: Record<TradeStatus, BadgeProps["variant"]> = {
     новое: "default",
@@ -538,7 +590,7 @@ function createEmptySettingsForm(): SettingsForm {
     telegramBotToken: "",
     telegramChatId: "",
     maxWantedPagesExclusive: "5",
-    loopPauseMs: "6000",
+    loopPauseMs: "5000",
     browserMode: "headless",
     safeMode: true,
     autoAcceptEnabled: false,
@@ -554,6 +606,16 @@ function mergeSettingsIntoForm(current: SettingsForm, settings: ApiSettings): Se
     safeMode: settings.safeMode,
     autoAcceptEnabled: settings.autoAcceptEnabled,
   };
+}
+
+function getTradeMode(settings: Pick<ApiSettings | SettingsForm, "autoAcceptEnabled" | "safeMode">): TradeMode {
+  return !settings.safeMode && settings.autoAcceptEnabled ? "auto" : "safe";
+}
+
+function buildTradeModePatch(mode: TradeMode): Pick<SettingsForm, "autoAcceptEnabled" | "safeMode"> {
+  return mode === "auto"
+    ? { autoAcceptEnabled: true, safeMode: false }
+    : { autoAcceptEnabled: false, safeMode: true };
 }
 
 function buildMetrics(trades: TradeRecord[]) {

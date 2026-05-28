@@ -38,6 +38,7 @@ export type CardRank = (typeof recognizableRanks)[number];
 export interface TradeCard {
   cardId: string;
   url: string;
+  imageUrl?: string;
   title?: string;
   rank?: CardRank;
 }
@@ -76,7 +77,7 @@ export function createDefaultSettings(): BotSettings {
     safeMode: true,
     autoAcceptEnabled: false,
     maxWantedPagesExclusive: 5,
-    loopPauseMs: 6_000,
+    loopPauseMs: 5_000,
     browserMode: "headless",
     rankRecognitionVerified: false,
   };

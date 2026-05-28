@@ -60,11 +60,11 @@ export interface ApiState {
 export interface SettingsPatch {
   telegramBotToken?: string;
   telegramChatId?: string;
-  maxWantedPagesExclusive: number;
-  loopPauseMs: number;
-  browserMode: BotSettings["browserMode"];
-  safeMode: boolean;
-  autoAcceptEnabled: boolean;
+  maxWantedPagesExclusive?: number;
+  loopPauseMs?: number;
+  browserMode?: BotSettings["browserMode"];
+  safeMode?: boolean;
+  autoAcceptEnabled?: boolean;
 }
 
 export async function loadState(): Promise<ApiState> {
