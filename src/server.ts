@@ -607,6 +607,7 @@ function logTradesPass(result: TradesPassResult): void {
     skippedTradeIds: result.skippedTradeIds,
     staleCount: result.staleCount,
     visibleCount: result.visibleTrades.length,
+    visibleTradeIds: result.visibleTrades.map((trade) => trade.tradeId).join(","),
   });
 }
 
