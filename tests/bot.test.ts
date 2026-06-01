@@ -21,6 +21,7 @@ import type {
   MangabuffSessionClient,
   MangabuffTextResponse,
 } from "../src/mangabuff-http.js";
+import { MangabuffHttpSession } from "../src/mangabuff-http.js";
 import { scanVisibleTradesInHttpSession } from "../src/trades.js";
 
 const tradesUrl = "https://mangabuff.ru/trades";
@@ -34,6 +35,70 @@ test("HTTP-scan keeps browser entry points out of the bot run path", async () =>
   assert.doesNotMatch(scanFunction, /openSavedMangabuffSession/);
   assert.match(loopFunction, /openSavedMangabuffHttpSession/);
   assert.doesNotMatch(loopFunction, /openSavedMangabuffSession/);
+});
+
+test("HTTP session updates cookies from Mangabuff responses before later POST requests", async () => {
+  const originalFetch = globalThis.fetch;
+  const requestCookies: string[] = [];
+  const requestContentTypes: string[] = [];
+  const requestBodies: Array<BodyInit | null | undefined> = [];
+  let requestCount = 0;
+
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    const headers = init?.headers as Record<string, string> | undefined;
+    requestCookies.push(headers?.cookie ?? "");
+    requestContentTypes.push(headers?.["content-type"] ?? "");
+    requestBodies.push(init?.body);
+    requestCount += 1;
+
+    if (requestCount === 1) {
+      return new Response("<html></html>", {
+        headers: {
+          "set-cookie": "XSRF-TOKEN=fresh-token; Path=/; Expires=Wed, 21 Oct 2030 07:28:00 GMT",
+        },
+        status: 200,
+      });
+    }
+
+    return new Response('{"ok":true}', { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const session = new MangabuffHttpSession([
+      {
+        domain: ".mangabuff.ru",
+        expires: -1,
+        name: "XSRF-TOKEN",
+        path: "/",
+        value: "old-token",
+      },
+      {
+        domain: "mangabuff.ru",
+        expires: -1,
+        name: "laravel_session",
+        path: "/",
+        value: "session",
+      },
+    ]);
+
+    await session.getText("https://mangabuff.ru/trades/1002");
+    await session.postForm(
+      "https://mangabuff.ru/trades/1002/accept",
+      {},
+      {
+        csrfToken: "page-csrf-token",
+        referer: "https://mangabuff.ru/trades/1002",
+      },
+    );
+
+    assert.match(requestCookies[0], /XSRF-TOKEN=old-token/);
+    assert.match(requestCookies[1], /XSRF-TOKEN=fresh-token/);
+    assert.doesNotMatch(requestCookies[1], /XSRF-TOKEN=old-token/);
+    assert.equal(requestContentTypes[1], "application/x-www-form-urlencoded; charset=UTF-8");
+    assert.equal(requestBodies[1], "");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("safe mode records an exchange that passes rules without accepting it", async () => {
@@ -219,6 +284,111 @@ test("auto mode accepts a passing exchange through HTTP with CSRF and referer", 
         url: "https://mangabuff.ru/trades/1002/accept",
       },
     ]);
+  });
+});
+
+test("auto mode accepts a previously safe-passed visible exchange through HTTP", async () => {
+  await withDatabase(async (db) => {
+    const session = new FakeHttpSession();
+    const settings = createAutoAcceptSettings();
+
+    insertNewTrade(db, "1016", "https://mangabuff.ru/trades/1016");
+    updateTradeStatus(db, "1016", "бот_бы_принял", "Safe mode marked this exchange as acceptable.");
+    await queuePassingTradeBeforeAccept(session, "1016");
+
+    const result = await scanVisibleTradesInHttpSession(db, session, settings);
+    const trade = findTradeById(db, "1016");
+
+    assert.equal(result.acceptedCount, 1);
+    assert.equal(trade?.status, "принят");
+    assert.equal(trade?.acceptAttempts, 1);
+    assert.deepEqual(
+      session.posts.map((post) => post.url),
+      ["https://mangabuff.ru/trades/1016/accept"],
+    );
+  });
+});
+
+test("auto mode does not post acceptance when the accept button disappears before HTTP accept", async () => {
+  await withDatabase(async (db) => {
+    const session = new FakeHttpSession();
+    const settings = createAutoAcceptSettings();
+    await queuePassingTradeBeforeAccept(session, "1012", {
+      acceptPageHtml: activeTradeHtml({ includeAcceptButton: false, tradeId: "1012" }),
+    });
+
+    const result = await scanVisibleTradesInHttpSession(db, session, settings);
+    const trade = findTradeById(db, "1012");
+
+    assert.equal(result.acceptedCount, 0);
+    assert.equal(result.checkErrorCount, 1);
+    assert.equal(trade?.status, "ошибка_проверки");
+    assert.equal(trade?.acceptAttempts, 0);
+    assert.equal(session.posts.length, 0);
+    assert.match(trade?.reason ?? "", /кнопку "Принять обмен"/);
+  });
+});
+
+test("auto mode does not post acceptance when CSRF is missing before HTTP accept", async () => {
+  await withDatabase(async (db) => {
+    const session = new FakeHttpSession();
+    const settings = createAutoAcceptSettings();
+    await queuePassingTradeBeforeAccept(session, "1013", {
+      acceptPageHtml: activeTradeHtml({ omitCsrfToken: true, tradeId: "1013" }),
+    });
+
+    const result = await scanVisibleTradesInHttpSession(db, session, settings);
+    const trade = findTradeById(db, "1013");
+
+    assert.equal(result.acceptedCount, 0);
+    assert.equal(result.checkErrorCount, 1);
+    assert.equal(trade?.status, "ошибка_проверки");
+    assert.equal(trade?.acceptAttempts, 0);
+    assert.equal(session.posts.length, 0);
+    assert.match(trade?.reason ?? "", /CSRF-токен/);
+  });
+});
+
+test("auto mode records an accept attempt when Mangabuff rejects the HTTP accept POST", async () => {
+  await withDatabase(async (db) => {
+    const session = new FakeHttpSession();
+    const settings = createAutoAcceptSettings();
+    await queuePassingTradeBeforeAccept(session, "1014");
+
+    session.queuePost(
+      "https://mangabuff.ru/trades/1014/accept",
+      jsonResponse("https://mangabuff.ru/trades/1014/accept", { message: "Произошла ошибка, обновите страницу" }, 419, false),
+    );
+
+    const result = await scanVisibleTradesInHttpSession(db, session, settings);
+    const trade = findTradeById(db, "1014");
+
+    assert.equal(result.acceptedCount, 0);
+    assert.equal(result.checkErrorCount, 1);
+    assert.equal(trade?.status, "ошибка_проверки");
+    assert.equal(trade?.acceptAttempts, 1);
+    assert.equal(session.posts.length, 1);
+    assert.match(trade?.reason ?? "", /HTTP 419: Произошла ошибка, обновите страницу/);
+  });
+});
+
+test("auto mode records a failed accept attempt when accepted state is not confirmed after POST", async () => {
+  await withDatabase(async (db) => {
+    const session = new FakeHttpSession();
+    const settings = createAutoAcceptSettings();
+    await queuePassingTradeBeforeAccept(session, "1015", {
+      afterAcceptPageHtml: activeTradeHtml({ csrfToken: "csrf-1015", tradeId: "1015" }),
+    });
+
+    const result = await scanVisibleTradesInHttpSession(db, session, settings);
+    const trade = findTradeById(db, "1015");
+
+    assert.equal(result.acceptedCount, 0);
+    assert.equal(result.checkErrorCount, 1);
+    assert.equal(trade?.status, "ошибка_проверки");
+    assert.equal(trade?.acceptAttempts, 1);
+    assert.equal(session.posts.length, 1);
+    assert.match(trade?.reason ?? "", /не показал статус `Обмен принят`/);
   });
 });
 
@@ -476,6 +646,7 @@ class FakeHttpSession implements MangabuffSessionClient {
 
   private readonly textResponses = new Map<string, MangabuffTextResponse[]>();
   private readonly bytesResponses = new Map<string, Uint8Array>();
+  private readonly postResponses = new Map<string, MangabuffJsonResponse[]>();
 
   queueText(url: string, ...responses: MangabuffTextResponse[]): void {
     this.textResponses.set(normalizeUrl(url), responses);
@@ -483,6 +654,10 @@ class FakeHttpSession implements MangabuffSessionClient {
 
   setBytes(url: string, bytes: Uint8Array): void {
     this.bytesResponses.set(normalizeUrl(url), bytes);
+  }
+
+  queuePost(url: string, ...responses: MangabuffJsonResponse[]): void {
+    this.postResponses.set(normalizeUrl(url), responses);
   }
 
   async getText(url: string): Promise<MangabuffTextResponse> {
@@ -516,12 +691,22 @@ class FakeHttpSession implements MangabuffSessionClient {
     };
   }
 
-  async postJson(
+  async postForm(
     url: string,
     data: unknown,
     options: { csrfToken?: string; referer?: string; timeoutMs?: number } = {},
   ): Promise<MangabuffJsonResponse> {
-    this.posts.push({ url: normalizeUrl(url), data, options });
+    const normalizedUrl = normalizeUrl(url);
+    this.posts.push({ url: normalizedUrl, data, options });
+    const responses = this.postResponses.get(normalizedUrl);
+
+    if (responses && responses.length > 0) {
+      if (responses.length === 1) {
+        return responses[0];
+      }
+
+      return responses.shift()!;
+    }
 
     return {
       json: { ok: true },
@@ -554,6 +739,21 @@ function htmlResponse(url: string, text: string, status = 200, ok = true): Manga
   };
 }
 
+function jsonResponse(
+  url: string,
+  json: unknown,
+  status = 200,
+  ok = true,
+): MangabuffJsonResponse {
+  return {
+    json,
+    ok,
+    status,
+    text: JSON.stringify(json),
+    url: normalizeUrl(url),
+  };
+}
+
 function tradesListHtml(tradeIds: string[]): string {
   return `
     <html>
@@ -567,6 +767,8 @@ function tradesListHtml(tradeIds: string[]): string {
 
 function activeTradeHtml(options: {
   csrfToken?: string;
+  includeAcceptButton?: boolean;
+  omitCsrfToken?: boolean;
   offeredCards?: TestCard[];
   requestedCards?: TestCard[];
   tradeId: string;
@@ -580,7 +782,7 @@ function activeTradeHtml(options: {
 
   return `
     <html>
-      <head><meta name="csrf-token" content="${options.csrfToken ?? `csrf-${options.tradeId}`}"></head>
+      <head>${options.omitCsrfToken ? "" : `<meta name="csrf-token" content="${options.csrfToken ?? `csrf-${options.tradeId}`}">`}</head>
       <body>
         <div class="trade">
           <div class="trade__header">
@@ -592,11 +794,49 @@ function activeTradeHtml(options: {
           <div class="trade__main-items--receiver">
             ${requestedCards.map(cardLinkHtml).join("\n")}
           </div>
-          <button class="button trade__accepted-btn">Принять обмен</button>
+          ${options.includeAcceptButton === false ? "" : '<button class="button trade__accepted-btn">Принять обмен</button>'}
         </div>
       </body>
     </html>
   `;
+}
+
+function createAutoAcceptSettings() {
+  const settings = createDefaultSettings();
+
+  settings.autoAcceptEnabled = true;
+  settings.safeMode = false;
+
+  return settings;
+}
+
+async function queuePassingTradeBeforeAccept(
+  session: FakeHttpSession,
+  tradeId: string,
+  options: {
+    acceptPageHtml?: string;
+    afterAcceptPageHtml?: string;
+  } = {},
+): Promise<void> {
+  const requestedImage = await createRankImage(0.56, 0.8, 0.3);
+  const offeredImage = await createRankImage(0.09, 0.8, 0.35);
+
+  session.queueText(tradesUrl, htmlResponse(tradesUrl, tradesListHtml([tradeId])));
+  session.queueText(
+    `https://mangabuff.ru/trades/${tradeId}`,
+    htmlResponse(`https://mangabuff.ru/trades/${tradeId}`, activeTradeHtml({ tradeId })),
+    htmlResponse(`https://mangabuff.ru/trades/${tradeId}`, options.acceptPageHtml ?? activeTradeHtml({ tradeId })),
+    htmlResponse(
+      `https://mangabuff.ru/trades/${tradeId}`,
+      options.afterAcceptPageHtml ?? "<html><body>Обмен принят</body></html>",
+    ),
+  );
+  session.queueText(
+    "https://mangabuff.ru/cards/201/offers/want",
+    htmlResponse("https://mangabuff.ru/cards/201/offers/want", wantedUsersHtml(1)),
+  );
+  session.setBytes("https://mangabuff.ru/img/cards/requested-d.png", requestedImage);
+  session.setBytes("https://mangabuff.ru/img/cards/offered-c.png", offeredImage);
 }
 
 function wantedUsersHtml(pagesCount: number): string {

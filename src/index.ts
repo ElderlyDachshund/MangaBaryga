@@ -1,7 +1,8 @@
 import "dotenv/config";
 import { createDefaultSettings, type TradeCard, type TradeRecord } from "./domain.js";
-import { checkMangabuffSession, openSavedMangabuffSession, saveMangabuffSession } from "./browser.js";
+import { openSavedMangabuffSession, saveMangabuffSession } from "./browser.js";
 import { listTrades, openDatabase } from "./db.js";
+import { checkSavedMangabuffHttpSession } from "./mangabuff-http.js";
 import { verifyRankSamples } from "./ranks.js";
 import { startControlServer } from "./server.js";
 import { runVisibleTradesLoop, scanVisibleTrades, type TradesPassResult } from "./trades.js";
@@ -18,7 +19,7 @@ switch (command) {
   }
 
   case "check-auth": {
-    const isAuthorized = await checkMangabuffSession(settings);
+    const isAuthorized = await checkSavedMangabuffHttpSession();
     console.log(isAuthorized ? "Сессия Mangabuff активна." : "Нужна авторизация Mangabuff.");
     process.exitCode = isAuthorized ? 0 : 1;
     break;

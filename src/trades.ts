@@ -20,6 +20,7 @@ import {
   type BrowserSession,
 } from "./browser.js";
 import {
+  isMangabuffAuthorizedHttpResponse,
   openSavedMangabuffHttpSession,
   type MangabuffSessionClient,
   type MangabuffTextResponse,
@@ -197,7 +198,7 @@ export async function scanVisibleTradesInHttpSession(
     throw new Error("Mangabuff вернул ошибку 505 при загрузке вкладки предложений.");
   }
 
-  if (!isMangabuffAuthorizedHttp(tradesPage)) {
+  if (!isMangabuffAuthorizedHttpResponse(tradesPage)) {
     throw new Error("Нужна авторизация Mangabuff.");
   }
 
@@ -249,7 +250,7 @@ export async function scanVisibleTradesInHttpSession(
 
     const nextTradeSettings = resolveBotSettings(settings);
 
-    if (result.processed && hasLaterProcessableTrade(db, visibleTrades, index, nextTradeSettings, false)) {
+    if (result.processed && hasLaterProcessableTrade(db, visibleTrades, index, nextTradeSettings, true)) {
       await waitBetweenTrades();
     }
   }
@@ -375,7 +376,7 @@ async function processVisibleTradeHttp(
 ): Promise<ProcessTradeResult> {
   const record = findTradeById(db, trade.tradeId);
 
-  if (!shouldProcessTrade(record, settings, false)) {
+  if (!shouldProcessTrade(record, settings, true)) {
     return { processed: false, outcome: "skipped" };
   }
 
@@ -761,7 +762,7 @@ async function acceptTradeAfterRulesPassHttp(
 
   recordTradeAcceptAttempt(db, trade.tradeId);
 
-  const acceptResponse = await session.postJson(
+  const acceptResponse = await session.postForm(
     `https://mangabuff.ru/trades/${trade.tradeId}/accept`,
     {},
     {
@@ -1243,21 +1244,6 @@ async function hasVisibleWantedUsers(page: Page): Promise<boolean> {
   });
 
   return userLinksCount > 0;
-}
-
-function isMangabuffAuthorizedHttp(response: MangabuffTextResponse): boolean {
-  const url = new URL(response.url);
-  const text = htmlToText(response.text);
-
-  if (url.pathname.includes("login") || url.pathname.includes("auth")) {
-    return false;
-  }
-
-  if (text.includes("предложения") || text.includes("отправленные")) {
-    return true;
-  }
-
-  return !text.includes("войти") && !text.includes("авторизация");
 }
 
 function getTradePageStateFromHtml(

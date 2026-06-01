@@ -7,13 +7,14 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   cancelMangabuffManualAuth,
-  checkMangabuffSession,
   completeMangabuffManualAuth,
+  mangabuffTradesUrl,
   startMangabuffManualAuth,
   type ManualAuthSession,
 } from "./browser.js";
 import { listTrades, loadSettings, openDatabase, saveSettingsPatch, type AppDatabase } from "./db.js";
 import type { BotSettings } from "./domain.js";
+import { checkSavedMangabuffHttpSession } from "./mangabuff-http.js";
 import { runVisibleTradesLoop, type TradesPassResult } from "./trades.js";
 import { assertTelegramConfigured } from "./telegram.js";
 
@@ -137,8 +138,7 @@ function createControlApp(): Hono {
   });
 
   app.get("/api/auth/status", async (context) => {
-    const settings = loadRuntimeSettings(db);
-    const authorized = await checkMangabuffSession(settings);
+    const authorized = await checkSavedMangabuffHttpSession();
 
     return context.json({ authorized });
   });
@@ -167,7 +167,7 @@ async function startBot(db: AppDatabase): Promise<void> {
   const settings = loadRuntimeSettings(db);
   assertTelegramConfigured(settings);
 
-  const authorized = await checkMangabuffSession(settings);
+  const authorized = await checkSavedMangabuffHttpSession();
 
   if (!authorized) {
     throw new HttpError(400, "Нужна авторизация Mangabuff.");
@@ -211,7 +211,12 @@ function stopBot(): void {
 
 async function startManualAuth(): Promise<void> {
   if (manualAuthSession) {
-    return;
+    if (await focusManualAuth(manualAuthSession)) {
+      return;
+    }
+
+    await cancelMangabuffManualAuth(manualAuthSession).catch(() => {});
+    manualAuthSession = undefined;
   }
 
   manualAuthSession = await startMangabuffManualAuth();
@@ -222,7 +227,17 @@ async function completeManualAuth(): Promise<boolean> {
     throw new HttpError(400, "Окно авторизации не запущено.");
   }
 
-  const saved = await completeMangabuffManualAuth(manualAuthSession);
+  let saved: boolean;
+
+  try {
+    saved = await completeMangabuffManualAuth(manualAuthSession);
+  } catch (error) {
+    if (!isManualAuthConnected(manualAuthSession)) {
+      manualAuthSession = undefined;
+    }
+
+    throw error;
+  }
 
   if (saved) {
     manualAuthSession = undefined;
@@ -238,6 +253,27 @@ async function cancelManualAuth(): Promise<void> {
 
   await cancelMangabuffManualAuth(manualAuthSession);
   manualAuthSession = undefined;
+}
+
+async function focusManualAuth(authSession: ManualAuthSession): Promise<boolean> {
+  if (!isManualAuthConnected(authSession)) {
+    return false;
+  }
+
+  const { page } = authSession.browserSession;
+
+  await page.bringToFront().catch(() => {});
+
+  if (page.url() === "about:blank") {
+    await page.goto(mangabuffTradesUrl, { waitUntil: "commit", timeout: 10_000 }).catch(() => {});
+    await page.bringToFront().catch(() => {});
+  }
+
+  return isManualAuthConnected(authSession);
+}
+
+function isManualAuthConnected(authSession: ManualAuthSession): boolean {
+  return authSession.browserSession.browser.isConnected() && !authSession.browserSession.page.isClosed();
 }
 
 function buildState(db: AppDatabase): object {

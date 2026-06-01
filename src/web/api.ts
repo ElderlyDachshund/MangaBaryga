@@ -94,6 +94,10 @@ export async function completeAuth(): Promise<{ saved: boolean }> {
   return request<{ saved: boolean }>("/api/auth/complete", { method: "POST" });
 }
 
+export async function cancelAuth(): Promise<{ active: boolean }> {
+  return request<{ active: boolean }>("/api/auth/cancel", { method: "POST" });
+}
+
 export async function checkAuth(): Promise<{ authorized: boolean }> {
   return request<{ authorized: boolean }>("/api/auth/status");
 }

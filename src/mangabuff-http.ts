@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { setTimeout as sleep } from "node:timers/promises";
-import { mangabuffStorageStatePath } from "./browser.js";
+import { mangabuffStorageStatePath, mangabuffTradesUrl } from "./browser.js";
 
 interface StorageStateCookie {
   name: string;
@@ -39,7 +39,7 @@ export interface MangabuffJsonResponse {
 export interface MangabuffSessionClient {
   getText(url: string, timeoutMs?: number): Promise<MangabuffTextResponse>;
   getBytes(url: string, timeoutMs?: number): Promise<MangabuffBytesResponse>;
-  postJson(
+  postForm(
     url: string,
     data: unknown,
     options?: {
@@ -77,7 +77,7 @@ export class MangabuffHttpSession implements MangabuffSessionClient {
     };
   }
 
-  async postJson(
+  async postForm(
     url: string,
     data: unknown,
     options: {
@@ -87,8 +87,8 @@ export class MangabuffHttpSession implements MangabuffSessionClient {
     } = {},
   ): Promise<MangabuffJsonResponse> {
     const response = await this.fetch(url, options.timeoutMs ?? 20_000, "application/json, text/plain, */*", {
-      body: JSON.stringify(data),
-      contentType: "application/json",
+      body: buildFormUrlEncodedBody(data),
+      contentType: "application/x-www-form-urlencoded; charset=UTF-8",
       csrfToken: options.csrfToken,
       method: "POST",
       referer: options.referer,
@@ -156,6 +156,8 @@ export class MangabuffHttpSession implements MangabuffSessionClient {
       signal: AbortSignal.timeout(timeoutMs),
     });
 
+    this.storeResponseCookies(response, url);
+
     if (response.status === 429) {
       await sleep(readRetryAfterMs(response) ?? defaultRateLimitRetryMs);
     }
@@ -185,6 +187,45 @@ export class MangabuffHttpSession implements MangabuffSessionClient {
       .map((cookie) => `${cookie.name}=${cookie.value}`)
       .join("; ");
   }
+
+  private storeResponseCookies(response: Response, requestUrl: string): void {
+    const setCookieHeaders = readSetCookieHeaders(response.headers);
+
+    if (setCookieHeaders.length === 0) {
+      return;
+    }
+
+    const responseUrl = new URL(response.url || requestUrl);
+
+    for (const header of setCookieHeaders) {
+      const cookie = parseSetCookieHeader(header, responseUrl);
+
+      if (!cookie) {
+        continue;
+      }
+
+      const existingIndex = this.cookies.findIndex(
+        (existing) =>
+          existing.name === cookie.name &&
+          normalizeCookieDomain(existing.domain) === normalizeCookieDomain(cookie.domain) &&
+          existing.path === cookie.path,
+      );
+
+      if (cookie.expires >= 0 && cookie.expires <= Date.now() / 1_000) {
+        if (existingIndex >= 0) {
+          this.cookies.splice(existingIndex, 1);
+        }
+
+        continue;
+      }
+
+      if (existingIndex >= 0) {
+        this.cookies[existingIndex] = cookie;
+      } else {
+        this.cookies.push(cookie);
+      }
+    }
+  }
 }
 
 export async function openSavedMangabuffHttpSession(
@@ -194,8 +235,42 @@ export async function openSavedMangabuffHttpSession(
   return new MangabuffHttpSession(state.cookies);
 }
 
+export async function checkSavedMangabuffHttpSession(
+  storageStatePath = mangabuffStorageStatePath,
+): Promise<boolean> {
+  let session: MangabuffHttpSession;
+
+  try {
+    session = await openSavedMangabuffHttpSession(storageStatePath);
+  } catch (error) {
+    if (isFileMissingError(error)) {
+      return false;
+    }
+
+    throw error;
+  }
+
+  const response = await session.getText(mangabuffTradesUrl);
+  return isMangabuffAuthorizedHttpResponse(response);
+}
+
+export function isMangabuffAuthorizedHttpResponse(response: MangabuffTextResponse): boolean {
+  const url = new URL(response.url);
+  const text = htmlToText(response.text);
+
+  if (url.pathname.includes("login") || url.pathname.includes("auth")) {
+    return false;
+  }
+
+  if (text.includes("предложения") || text.includes("отправленные")) {
+    return true;
+  }
+
+  return !text.includes("войти") && !text.includes("авторизация");
+}
+
 function cookieMatchesUrl(cookie: StorageStateCookie, url: URL): boolean {
-  const cookieDomain = cookie.domain.startsWith(".") ? cookie.domain.slice(1) : cookie.domain;
+  const cookieDomain = normalizeCookieDomain(cookie.domain);
   const domainMatches = url.hostname === cookieDomain || url.hostname.endsWith(`.${cookieDomain}`);
 
   if (!domainMatches) {
@@ -203,6 +278,130 @@ function cookieMatchesUrl(cookie: StorageStateCookie, url: URL): boolean {
   }
 
   return url.pathname.startsWith(cookie.path);
+}
+
+function normalizeCookieDomain(domain: string): string {
+  return domain.startsWith(".") ? domain.slice(1) : domain;
+}
+
+function readSetCookieHeaders(headers: Headers): string[] {
+  const getSetCookie = (headers as Headers & { getSetCookie?: () => string[] }).getSetCookie;
+
+  if (typeof getSetCookie === "function") {
+    return getSetCookie.call(headers);
+  }
+
+  const setCookie = headers.get("set-cookie");
+
+  if (!setCookie) {
+    return [];
+  }
+
+  return splitCombinedSetCookieHeader(setCookie);
+}
+
+function splitCombinedSetCookieHeader(header: string): string[] {
+  const cookies: string[] = [];
+  let start = 0;
+  let inExpires = false;
+
+  for (let index = 0; index < header.length; index += 1) {
+    const char = header[index];
+
+    if (char === ",") {
+      if (!inExpires) {
+        cookies.push(header.slice(start, index).trim());
+        start = index + 1;
+      }
+
+      continue;
+    }
+
+    if (char === ";") {
+      inExpires = false;
+      continue;
+    }
+
+    if (header.slice(index, index + 8).toLowerCase() === "expires=") {
+      inExpires = true;
+      index += 7;
+    }
+  }
+
+  cookies.push(header.slice(start).trim());
+  return cookies.filter(Boolean);
+}
+
+function parseSetCookieHeader(header: string, responseUrl: URL): StorageStateCookie | undefined {
+  const [nameValue, ...attributes] = header.split(";");
+  const equalsIndex = nameValue.indexOf("=");
+
+  if (equalsIndex <= 0) {
+    return undefined;
+  }
+
+  const name = nameValue.slice(0, equalsIndex).trim();
+
+  if (!name) {
+    return undefined;
+  }
+
+  const cookie: StorageStateCookie = {
+    domain: responseUrl.hostname,
+    expires: -1,
+    name,
+    path: defaultCookiePath(responseUrl.pathname),
+    value: nameValue.slice(equalsIndex + 1).trim(),
+  };
+
+  for (const attribute of attributes) {
+    const [rawName, ...rawValueParts] = attribute.trim().split("=");
+    const attributeName = rawName.toLowerCase();
+    const attributeValue = rawValueParts.join("=");
+
+    if (attributeName === "domain" && attributeValue) {
+      cookie.domain = attributeValue.trim().replace(/^\./, "");
+    } else if (attributeName === "path" && attributeValue) {
+      cookie.path = attributeValue.trim();
+    } else if (attributeName === "expires" && attributeValue) {
+      const expires = Date.parse(attributeValue);
+
+      if (Number.isFinite(expires)) {
+        cookie.expires = Math.floor(expires / 1_000);
+      }
+    } else if (attributeName === "max-age" && attributeValue) {
+      const maxAgeSeconds = Number(attributeValue);
+
+      if (Number.isFinite(maxAgeSeconds)) {
+        cookie.expires = Math.floor(Date.now() / 1_000 + maxAgeSeconds);
+      }
+    }
+  }
+
+  return cookie;
+}
+
+function defaultCookiePath(pathname: string): string {
+  if (!pathname.startsWith("/")) {
+    return "/";
+  }
+
+  const lastSlashIndex = pathname.lastIndexOf("/");
+
+  if (lastSlashIndex <= 0) {
+    return "/";
+  }
+
+  return pathname.slice(0, lastSlashIndex);
+}
+
+function isFileMissingError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "ENOENT"
+  );
 }
 
 const defaultRequestDelayMs = readIntegerEnv("MANGABUFF_HTTP_REQUEST_DELAY_MS", 1_500, 250, 30_000);
@@ -257,4 +456,48 @@ function parseJsonSafely(text: string): unknown {
   } catch {
     return {};
   }
+}
+
+function buildFormUrlEncodedBody(data: unknown): string {
+  if (data instanceof URLSearchParams) {
+    return data.toString();
+  }
+
+  if (!data || typeof data !== "object") {
+    return "";
+  }
+
+  const params = new URLSearchParams();
+
+  for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
+    appendFormValue(params, key, value);
+  }
+
+  return params.toString();
+}
+
+function appendFormValue(params: URLSearchParams, key: string, value: unknown): void {
+  if (value === undefined || value === null) {
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      appendFormValue(params, key, item);
+    }
+
+    return;
+  }
+
+  params.append(key, String(value));
+}
+
+function htmlToText(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
 }

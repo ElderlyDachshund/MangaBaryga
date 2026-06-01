@@ -1,4 +1,4 @@
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import type { Browser, BrowserContext, Page } from "playwright";
 import { access, mkdir } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { dirname } from "node:path";
@@ -55,7 +55,9 @@ export async function startMangabuffManualAuth(
     useSavedSession: true,
   });
 
-  await browserSession.page.goto(mangabuffTradesUrl, { waitUntil: "domcontentloaded" });
+  await browserSession.page.bringToFront().catch(() => {});
+  await browserSession.page.goto(mangabuffTradesUrl, { waitUntil: "commit", timeout: 10_000 }).catch(() => {});
+  await browserSession.page.bringToFront().catch(() => {});
 
   return { browserSession, storageStatePath };
 }
@@ -120,6 +122,7 @@ async function openMangabuffBrowser(options: {
   storageStatePath: string;
   useSavedSession: boolean;
 }): Promise<BrowserSession> {
+  const { chromium } = await import("playwright");
   const browser = await chromium.launch({
     args: ["--disable-dev-shm-usage", "--no-sandbox"],
     headless: options.headless,

@@ -1,6 +1,7 @@
 FROM node:20-bookworm-slim
 
 WORKDIR /opt/baryga-manga
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
 COPY package*.json ./
 RUN npm ci
@@ -9,7 +10,8 @@ COPY . .
 RUN npm run build
 RUN test -f /opt/baryga-manga/dist/index.js && test -f /opt/baryga-manga/dist/web/index.html
 RUN npm prune --omit=dev
-RUN node node_modules/playwright/cli.js install --with-deps --only-shell chromium
+ARG INSTALL_PLAYWRIGHT=false
+RUN if [ "$INSTALL_PLAYWRIGHT" = "true" ]; then node node_modules/playwright/cli.js install --with-deps --only-shell chromium; fi
 
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0

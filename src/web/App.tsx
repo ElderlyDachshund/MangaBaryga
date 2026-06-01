@@ -8,11 +8,13 @@ import {
   Save,
   ShieldCheck,
   Square,
+  X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { BotSettings, TradeCard, TradeRecord, TradeStatus } from "../domain";
 import {
   checkAuth,
+  cancelAuth,
   completeAuth,
   loadState,
   saveSettings,
@@ -200,6 +202,20 @@ export function App() {
                 variant="outline"
               >
                 Открыть вход
+              </Button>
+              <Button
+                disabled={!state?.auth.manualAuthActive || busyAction === "cancel-auth"}
+                onClick={() =>
+                  void runAction("cancel-auth", async () => {
+                    await cancelAuth();
+                    setAuthMessage({ kind: "notice", text: "Окно входа закрыто." });
+                    await refreshState();
+                  })
+                }
+                variant="outline"
+              >
+                <X />
+                Закрыть окно
               </Button>
               <Button
                 disabled={busyAction === "complete-auth"}

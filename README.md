@@ -14,6 +14,38 @@ Use the Dockerfile when the hosting platform supports it. Otherwise set:
 Do not use a generated wrapper such as `node /app/http-wrapper.js`, and do not start
 the app before the build command has created `dist/index.js`.
 
+## Low-memory host auth
+
+The normal bot loop uses the saved Mangabuff cookies through HTTP and does not keep
+Chromium running. On a 256 MB host, do Mangabuff login outside the host and upload
+the saved storage state file.
+
+Local machine:
+
+```sh
+npm run auth
+npm run check-auth
+```
+
+Then copy `playwright/.auth/mangabuff.json` to the host path used by
+`MANGABUFF_STORAGE_STATE_PATH`.
+
+Recommended host environment:
+
+- `MANGABUFF_STORAGE_STATE_PATH=/app/data/mangabuff.json`
+- `DATABASE_PATH=/app/data/baryga-manga.sqlite`
+- `AUTO_START_BOT=true` if the bot should start with the server
+- `TELEGRAM_BOT_TOKEN=...`
+- `TELEGRAM_CHAT_ID=...`
+
+Avoid using the panel's manual login flow on a 256 MB host. It needs Chromium and can
+exceed the memory limit. `npm run check-auth`, `/api/auth/status`, and bot startup use
+the lightweight HTTP check.
+
+The Docker image skips Chromium by default for low-memory deployments. If you really
+need browser-based login inside the container, build with
+`--build-arg INSTALL_PLAYWRIGHT=true`.
+
 ## Vercel web panel
 
 Vercel can host the React/Vite web panel as a static frontend. The bot API still needs
