@@ -12,7 +12,7 @@ let cachedBot: Bot | undefined;
 export function assertTelegramConfigured(settings: BotSettings): asserts settings is TelegramSettings {
   if (!settings.telegramBotToken || !settings.telegramChatId) {
     throw new Error(
-      "Telegram не настроен: укажи TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID в .env.",
+      "Telegram не настроен: укажи MANGA_TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID в .env.",
     );
   }
 }

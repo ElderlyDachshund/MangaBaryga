@@ -35,7 +35,7 @@ Recommended host environment:
 - `MANGABUFF_STORAGE_STATE_PATH=/app/data/mangabuff.json`
 - `DATABASE_PATH=/app/data/baryga-manga.sqlite`
 - `AUTO_START_BOT=true` if the bot should start with the server
-- `TELEGRAM_BOT_TOKEN=...`
+- `MANGA_TELEGRAM_BOT_TOKEN=...` (or `TELEGRAM_BOT_TOKEN` on hosts where that name is editable)
 - `TELEGRAM_CHAT_ID=...`
 
 Automatic re-login is available over plain HTTP when Mangabuff login/password

@@ -167,8 +167,12 @@ switch (command) {
 }
 
 function applyCliSettings(): void {
-  settings.telegramBotToken = readOptionalEnv("TELEGRAM_BOT_TOKEN");
-  settings.telegramChatId = readOptionalEnv("TELEGRAM_CHAT_ID");
+  settings.telegramBotToken = readFirstOptionalEnv([
+    "MANGA_TELEGRAM_BOT_TOKEN",
+    "APP_TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_BOT_TOKEN",
+  ]);
+  settings.telegramChatId = readFirstOptionalEnv(["MANGA_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID"]);
 
   if (process.argv.includes("--headful")) {
     settings.browserMode = "headful";
@@ -197,6 +201,18 @@ function applyCliSettings(): void {
 function readOptionalEnv(name: string): string | undefined {
   const value = process.env[name]?.trim();
   return value ? value : undefined;
+}
+
+function readFirstOptionalEnv(names: string[]): string | undefined {
+  for (const name of names) {
+    const value = readOptionalEnv(name);
+
+    if (value) {
+      return value;
+    }
+  }
+
+  return undefined;
 }
 
 function readRequiredEnv(name: string): string {

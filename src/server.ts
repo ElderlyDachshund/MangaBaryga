@@ -292,8 +292,12 @@ function buildState(db: AppDatabase): object {
 
 function loadRuntimeSettings(db: AppDatabase): BotSettings {
   const settings = loadSettings(db);
-  const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
-  const telegramChatId = process.env.TELEGRAM_CHAT_ID?.trim();
+  const telegramBotToken = readFirstOptionalEnv([
+    "MANGA_TELEGRAM_BOT_TOKEN",
+    "APP_TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_BOT_TOKEN",
+  ]);
+  const telegramChatId = readFirstOptionalEnv(["MANGA_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID"]);
 
   if (telegramBotToken) {
     settings.telegramBotToken = telegramBotToken;
@@ -443,13 +447,26 @@ function maskSecret(value: string | undefined): string | undefined {
 }
 
 function readPort(): number {
-  const port = Number(process.env.PORT ?? 3017);
+  const defaultPort = process.env.NODE_ENV === "production" ? 3000 : 3017;
+  const port = Number(process.env.PORT ?? defaultPort);
 
   if (!Number.isInteger(port) || port <= 0 || port > 65_535) {
     throw new Error("PORT должен быть целым числом от 1 до 65535.");
   }
 
   return port;
+}
+
+function readFirstOptionalEnv(names: string[]): string | undefined {
+  for (const name of names) {
+    const value = process.env[name]?.trim();
+
+    if (value) {
+      return value;
+    }
+  }
+
+  return undefined;
 }
 
 function startAutoLoginRefreshLoop(): void {
