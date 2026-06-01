@@ -14,7 +14,7 @@ import {
 } from "./browser.js";
 import { listTrades, loadSettings, openDatabase, saveSettingsPatch, type AppDatabase } from "./db.js";
 import type { BotSettings } from "./domain.js";
-import { checkSavedMangabuffHttpSession } from "./mangabuff-http.js";
+import { autoLoginMangabuffHttpSession, checkSavedMangabuffHttpSession } from "./mangabuff-http.js";
 import { runVisibleTradesLoop, type TradesPassResult } from "./trades.js";
 import { assertTelegramConfigured } from "./telegram.js";
 
@@ -44,6 +44,7 @@ const runtime: RuntimeState = {
 };
 let botAbortController: AbortController | undefined;
 let manualAuthSession: ManualAuthSession | undefined;
+let autoLoginRefreshRunning = false;
 
 export function startControlServer(port = readPort()): void {
   const hostname = readHostname();
@@ -68,6 +69,8 @@ export function startControlServer(port = readPort()): void {
       );
     });
   }
+
+  startAutoLoginRefreshLoop();
 }
 
 function createControlApp(): Hono {
@@ -447,6 +450,95 @@ function readPort(): number {
   }
 
   return port;
+}
+
+function startAutoLoginRefreshLoop(): void {
+  const intervalHours = readAutoLoginIntervalHours();
+
+  if (!intervalHours) {
+    return;
+  }
+
+  const login = process.env.MANGABUFF_LOGIN?.trim();
+  const password = process.env.MANGABUFF_PASSWORD?.trim();
+
+  if (!login || !password) {
+    console.warn(
+      "Автообновление авторизации Mangabuff выключено: нужны MANGABUFF_LOGIN и MANGABUFF_PASSWORD.",
+    );
+    return;
+  }
+
+  const intervalMs = intervalHours * 60 * 60 * 1_000;
+  const scheduleNext = () => {
+    setTimeout(() => {
+      void runAutoLoginRefresh(login, password).finally(scheduleNext);
+    }, intervalMs);
+  };
+
+  console.log(`Автологин Mangabuff будет запускаться каждые ${intervalHours} ч.`);
+  scheduleNext();
+}
+
+async function runAutoLoginRefresh(login: string, password: string): Promise<void> {
+  if (autoLoginRefreshRunning) {
+    return;
+  }
+
+  autoLoginRefreshRunning = true;
+  const shouldRestartBot = runtime.running;
+
+  try {
+    if (shouldRestartBot) {
+      stopBot();
+      await waitForBotStopped();
+    }
+
+    const saved = await autoLoginMangabuffHttpSession({ login, password });
+
+    const time = new Date().toLocaleString("ru-RU");
+    console.log(
+      saved
+        ? `[${time}] Автологин Mangabuff выполнен, сессия сохранена.`
+        : `[${time}] Автологин Mangabuff не подтвердил авторизацию.`,
+    );
+
+    if (saved && shouldRestartBot) {
+      await startBot(db);
+    }
+  } catch (error) {
+    console.error(`Ошибка автологина Mangabuff: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    autoLoginRefreshRunning = false;
+  }
+}
+
+function readAutoLoginIntervalHours(): number | undefined {
+  const value = process.env.MANGABUFF_AUTO_LOGIN_INTERVAL_HOURS?.trim();
+
+  if (!value) {
+    return undefined;
+  }
+
+  const hours = Number(value);
+
+  if (!Number.isFinite(hours) || hours < 1 || hours > 168) {
+    throw new Error("MANGABUFF_AUTO_LOGIN_INTERVAL_HOURS должен быть числом от 1 до 168.");
+  }
+
+  return hours;
+}
+
+async function waitForBotStopped(timeoutMs = 660_000): Promise<void> {
+  const startedAt = Date.now();
+
+  while (runtime.running && Date.now() - startedAt < timeoutMs) {
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+
+  if (runtime.running) {
+    throw new Error("Не удалось дождаться остановки бота перед автологином Mangabuff.");
+  }
 }
 
 function readHostname(): string {

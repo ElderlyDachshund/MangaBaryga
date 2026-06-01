@@ -38,6 +38,22 @@ Recommended host environment:
 - `TELEGRAM_BOT_TOKEN=...`
 - `TELEGRAM_CHAT_ID=...`
 
+Automatic re-login is available over plain HTTP when Mangabuff login/password
+auth is enough:
+
+```sh
+MANGABUFF_LOGIN="email@example.com" \
+MANGABUFF_PASSWORD="password" \
+MANGABUFF_STORAGE_STATE_PATH=/app/data/mangabuff.json \
+npm run auth:auto
+```
+
+For a long-running server, set `MANGABUFF_AUTO_LOGIN_INTERVAL_HOURS=20` with
+`MANGABUFF_LOGIN` and `MANGABUFF_PASSWORD`. The server will fetch `/login`, send
+the AJAX login POST with the page CSRF token, verify `/trades`, and save a fresh
+storage state file. If the login check fails, the saved session file is left
+untouched.
+
 Avoid using the panel's manual login flow on a 256 MB host. It needs Chromium and can
 exceed the memory limit. `npm run check-auth`, `/api/auth/status`, and bot startup use
 the lightweight HTTP check.

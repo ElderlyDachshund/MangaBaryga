@@ -2,7 +2,7 @@ import "dotenv/config";
 import { createDefaultSettings, type TradeCard, type TradeRecord } from "./domain.js";
 import { openSavedMangabuffSession, saveMangabuffSession } from "./browser.js";
 import { listTrades, openDatabase } from "./db.js";
-import { checkSavedMangabuffHttpSession } from "./mangabuff-http.js";
+import { autoLoginMangabuffHttpSession, checkSavedMangabuffHttpSession } from "./mangabuff-http.js";
 import { verifyRankSamples } from "./ranks.js";
 import { startControlServer } from "./server.js";
 import { runVisibleTradesLoop, scanVisibleTrades, type TradesPassResult } from "./trades.js";
@@ -15,6 +15,21 @@ applyCliSettings();
 switch (command) {
   case "auth": {
     await saveMangabuffSession();
+    break;
+  }
+
+  case "auth:auto": {
+    const login = readRequiredEnv("MANGABUFF_LOGIN");
+    const password = readRequiredEnv("MANGABUFF_PASSWORD");
+    const saved = await autoLoginMangabuffHttpSession({ login, password });
+
+    if (saved) {
+      console.log("Автологин Mangabuff выполнен, сессия сохранена.");
+    } else {
+      console.log("Автологин Mangabuff не подтвердил авторизацию.");
+      process.exitCode = 1;
+    }
+
     break;
   }
 
@@ -136,6 +151,7 @@ switch (command) {
     console.log(`Default mode: ${settings.safeMode ? "safe" : "auto"}`);
     console.log("Commands:");
     console.log("  npm run auth       Войти в Mangabuff вручную и сохранить сессию");
+    console.log("  npm run auth:auto  Войти в Mangabuff по env-логину/паролю через HTTP и сохранить сессию");
     console.log("  npm run check-auth Проверить сохранённую сессию Mangabuff");
     console.log("  npm run scan-trades Найти видимые входящие обмены и сохранить новые");
     console.log("  npm run list-trades Показать последние записи истории обменов");
@@ -181,6 +197,16 @@ function applyCliSettings(): void {
 function readOptionalEnv(name: string): string | undefined {
   const value = process.env[name]?.trim();
   return value ? value : undefined;
+}
+
+function readRequiredEnv(name: string): string {
+  const value = readOptionalEnv(name);
+
+  if (!value) {
+    throw new Error(`Нужна переменная окружения ${name}.`);
+  }
+
+  return value;
 }
 
 function logTradesPass(result: TradesPassResult): void {

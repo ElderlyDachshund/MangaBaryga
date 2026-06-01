@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "auth": "tsx src/index.ts auth",
+    "auth:auto": "tsx src/index.ts auth:auto",
     "build": "npm run build:web && tsc -p tsconfig.json",
     "build:server": "tsc -p tsconfig.json",
     "build:web": "vite build",

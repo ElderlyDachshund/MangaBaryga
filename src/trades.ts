@@ -100,6 +100,8 @@ export async function scanVisibleTrades(
     }
 
     throw error;
+  } finally {
+    await session.saveStorageState();
   }
 }
 
@@ -108,13 +110,14 @@ export async function runVisibleTradesLoop(
   settings: BotSettings,
   options: TradesLoopOptions = {},
 ): Promise<void> {
-  const session = await openSavedMangabuffHttpSession();
   const settingsSource = options.getSettings ?? (() => settings);
   let passNumber = 0;
 
   while (!options.signal?.aborted) {
+    const session = await openSavedMangabuffHttpSession();
     passNumber += 1;
     const result = await runTradesPassWithTimeout(db, session, settingsSource, passNumber);
+    await session.saveStorageState();
     options.onPass?.(result);
 
     const currentSettings = resolveBotSettings(settingsSource);

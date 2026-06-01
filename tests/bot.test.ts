@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -21,7 +21,11 @@ import type {
   MangabuffSessionClient,
   MangabuffTextResponse,
 } from "../src/mangabuff-http.js";
-import { MangabuffHttpSession } from "../src/mangabuff-http.js";
+import {
+  autoLoginMangabuffHttpSession,
+  MangabuffHttpSession,
+  openSavedMangabuffHttpSession,
+} from "../src/mangabuff-http.js";
 import { scanVisibleTradesInHttpSession } from "../src/trades.js";
 
 const tradesUrl = "https://mangabuff.ru/trades";
@@ -94,10 +98,135 @@ test("HTTP session updates cookies from Mangabuff responses before later POST re
     assert.match(requestCookies[0], /XSRF-TOKEN=old-token/);
     assert.match(requestCookies[1], /XSRF-TOKEN=fresh-token/);
     assert.doesNotMatch(requestCookies[1], /XSRF-TOKEN=old-token/);
-    assert.equal(requestContentTypes[1], "application/x-www-form-urlencoded; charset=UTF-8");
-    assert.equal(requestBodies[1], "");
+    assert.equal(requestContentTypes[1], "");
+    assert.equal(requestBodies[1], undefined);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("HTTP session persists refreshed cookies back to saved storage state", async () => {
+  const originalFetch = globalThis.fetch;
+  const tempDir = await mkdtemp(join(tmpdir(), "mangabuff-auth-"));
+  const storageStatePath = join(tempDir, "mangabuff.json");
+
+  await writeFile(
+    storageStatePath,
+    JSON.stringify({
+      cookies: [
+        {
+          domain: ".mangabuff.ru",
+          expires: -1,
+          name: "XSRF-TOKEN",
+          path: "/",
+          value: "old-token",
+        },
+      ],
+      origins: [{ localStorage: [], origin: "https://mangabuff.ru" }],
+    }),
+    "utf8",
+  );
+
+  globalThis.fetch = (async () =>
+    new Response("<html></html>", {
+      headers: {
+        "set-cookie": "XSRF-TOKEN=fresh-token; Path=/; HttpOnly; Secure; SameSite=Lax",
+      },
+      status: 200,
+    })) as typeof fetch;
+
+  try {
+    const session = await openSavedMangabuffHttpSession(storageStatePath);
+    await session.getText("https://mangabuff.ru/trades");
+
+    assert.equal(await session.saveStorageState(), true);
+
+    const savedState = JSON.parse(await readFile(storageStatePath, "utf8"));
+
+    assert.equal(savedState.cookies.length, 1);
+    assert.equal(savedState.cookies[0].name, "XSRF-TOKEN");
+    assert.equal(savedState.cookies[0].value, "fresh-token");
+    assert.equal(savedState.cookies[0].httpOnly, true);
+    assert.equal(savedState.cookies[0].secure, true);
+    assert.equal(savedState.cookies[0].sameSite, "Lax");
+    assert.deepEqual(savedState.origins, [{ localStorage: [], origin: "https://mangabuff.ru" }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(tempDir, { force: true, recursive: true });
+  }
+});
+
+test("HTTP auto-login posts credentials with page CSRF and saves verified cookies", async () => {
+  const originalFetch = globalThis.fetch;
+  const tempDir = await mkdtemp(join(tmpdir(), "mangabuff-auth-"));
+  const storageStatePath = join(tempDir, "mangabuff.json");
+  const requests: Array<{
+    body: string;
+    cookie: string;
+    csrf: string;
+    method: string;
+    url: string;
+  }> = [];
+
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    const headers = init?.headers as Record<string, string> | undefined;
+    requests.push({
+      body: String(init?.body ?? ""),
+      cookie: headers?.cookie ?? "",
+      csrf: headers?.["x-csrf-token"] ?? "",
+      method: init?.method ?? "GET",
+      url,
+    });
+
+    if (url === "https://mangabuff.ru/login" && (init?.method ?? "GET") === "GET") {
+      return textResponseWithCookies(
+        '<html><head><meta name="csrf-token" content="csrf-from-page"></head></html>',
+        [
+          "XSRF-TOKEN=login-xsrf; Path=/; Expires=Wed, 21 Oct 2030 07:28:00 GMT",
+          "mangabuff_session=login-session; Path=/; HttpOnly; Expires=Wed, 21 Oct 2030 07:28:00 GMT",
+        ],
+      );
+    }
+
+    if (url === "https://mangabuff.ru/login" && init?.method === "POST") {
+      return textResponseWithCookies('{"ok":true}', [
+        "remember_web_test=remember-token; Path=/; HttpOnly; Expires=Wed, 21 Oct 2030 07:28:00 GMT",
+        "mangabuff_session=fresh-session; Path=/; HttpOnly; Expires=Wed, 21 Oct 2030 07:28:00 GMT",
+      ]);
+    }
+
+    if (url === "https://mangabuff.ru/trades") {
+      return textResponseWithCookies("<html><body>Предложения Отправленные</body></html>", [
+        "XSRF-TOKEN=fresh-xsrf; Path=/; Expires=Wed, 21 Oct 2030 07:28:00 GMT",
+      ]);
+    }
+
+    throw new Error(`Unexpected fetch: ${url}`);
+  }) as typeof fetch;
+
+  try {
+    const saved = await autoLoginMangabuffHttpSession({
+      login: "user@example.com",
+      password: "secret-password",
+      storageStatePath,
+    });
+    const savedState = JSON.parse(await readFile(storageStatePath, "utf8"));
+
+    assert.equal(saved, true);
+    assert.deepEqual(
+      requests.map((request) => `${request.method} ${request.url}`),
+      ["GET https://mangabuff.ru/login", "POST https://mangabuff.ru/login", "GET https://mangabuff.ru/trades"],
+    );
+    assert.equal(requests[1].csrf, "csrf-from-page");
+    assert.match(requests[1].cookie, /XSRF-TOKEN=login-xsrf/);
+    assert.match(requests[1].body, /email=user%40example\.com/);
+    assert.match(requests[1].body, /password=secret-password/);
+    assert.ok(savedState.cookies.some((cookie: { name: string }) => cookie.name === "remember_web_test"));
+    assert.ok(savedState.cookies.some((cookie: { name: string; value: string }) => cookie.value === "fresh-xsrf"));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(tempDir, { force: true, recursive: true });
   }
 });
 
@@ -737,6 +866,16 @@ function htmlResponse(url: string, text: string, status = 200, ok = true): Manga
     text,
     url: normalizeUrl(url),
   };
+}
+
+function textResponseWithCookies(text: string, cookies: string[], status = 200): Response {
+  const headers = new Headers();
+
+  for (const cookie of cookies) {
+    headers.append("set-cookie", cookie);
+  }
+
+  return new Response(text, { headers, status });
 }
 
 function jsonResponse(

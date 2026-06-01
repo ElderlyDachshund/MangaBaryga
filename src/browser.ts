@@ -6,6 +6,8 @@ import { stdin as input, stdout as output } from "node:process";
 import type { BotSettings } from "./domain.js";
 
 export const mangabuffTradesUrl = "https://mangabuff.ru/trades";
+export const mangabuffLoginUrl = "https://mangabuff.ru/login";
+export const mangabuffLogoutUrl = "https://mangabuff.ru/logout";
 export const mangabuffStorageStatePath =
   process.env.MANGABUFF_STORAGE_STATE_PATH ?? "playwright/.auth/mangabuff.json";
 
@@ -18,6 +20,13 @@ export interface BrowserSession {
 export interface ManualAuthSession {
   browserSession: BrowserSession;
   storageStatePath: string;
+}
+
+export interface MangabuffAutoLoginOptions {
+  headless?: boolean;
+  login: string;
+  password: string;
+  storageStatePath?: string;
 }
 
 export async function saveMangabuffSession(
@@ -41,6 +50,43 @@ export async function saveMangabuffSession(
     await mkdir(dirname(storageStatePath), { recursive: true });
     await session.context.storageState({ path: storageStatePath });
     console.log(`Сессия сохранена: ${storageStatePath}`);
+  } finally {
+    await session.browser.close();
+  }
+}
+
+export async function autoLoginMangabuffSession(options: MangabuffAutoLoginOptions): Promise<boolean> {
+  const storageStatePath = options.storageStatePath ?? mangabuffStorageStatePath;
+  const session = await openMangabuffBrowser({
+    headless: options.headless ?? true,
+    storageStatePath,
+    useSavedSession: true,
+  });
+
+  try {
+    await session.page.goto(mangabuffLogoutUrl, { waitUntil: "domcontentloaded", timeout: 20_000 }).catch(() => {});
+    await session.page.goto(mangabuffLoginUrl, { waitUntil: "domcontentloaded", timeout: 20_000 });
+    await session.page.locator('input[name="email"]').first().fill(options.login);
+    await session.page.locator('input[name="password"]').first().fill(options.password);
+
+    await Promise.all([
+      session.page.waitForURL((url) => !url.pathname.includes("/login"), { timeout: 20_000 }).catch(() => undefined),
+      session.page.locator(".login-button").first().click(),
+    ]);
+
+    await session.page.waitForLoadState("domcontentloaded").catch(() => {});
+    await session.page.goto(mangabuffTradesUrl, { waitUntil: "domcontentloaded", timeout: 20_000 }).catch(() => {});
+
+    const isAuthorized = await isMangabuffAuthorized(session.page);
+
+    if (!isAuthorized) {
+      return false;
+    }
+
+    await mkdir(dirname(storageStatePath), { recursive: true });
+    await session.context.storageState({ path: storageStatePath });
+
+    return true;
   } finally {
     await session.browser.close();
   }

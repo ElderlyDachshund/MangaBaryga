@@ -1,6 +1,7 @@
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { mangabuffStorageStatePath, mangabuffTradesUrl } from "./browser.js";
+import { mangabuffLoginUrl, mangabuffStorageStatePath, mangabuffTradesUrl } from "./browser.js";
 
 interface StorageStateCookie {
   name: string;
@@ -8,10 +9,15 @@ interface StorageStateCookie {
   domain: string;
   path: string;
   expires: number;
+  httpOnly?: boolean;
+  secure?: boolean;
+  sameSite?: "Strict" | "Lax" | "None";
 }
 
 interface StorageState {
   cookies: StorageStateCookie[];
+  origins?: unknown[];
+  [key: string]: unknown;
 }
 
 export interface MangabuffTextResponse {
@@ -50,16 +56,27 @@ export interface MangabuffSessionClient {
   ): Promise<MangabuffJsonResponse>;
 }
 
+export interface MangabuffHttpAutoLoginOptions {
+  login: string;
+  password: string;
+  storageStatePath?: string;
+}
+
 export class MangabuffHttpSession implements MangabuffSessionClient {
   private nextRequestAt = 0;
+  private cookiesDirty = false;
 
-  constructor(private readonly cookies: StorageStateCookie[]) {}
+  constructor(
+    private readonly cookies: StorageStateCookie[],
+    private readonly storageState?: StorageState,
+    private readonly storageStatePath?: string,
+  ) {}
 
   async getText(url: string, timeoutMs = 20_000): Promise<MangabuffTextResponse> {
     const response = await this.fetch(url, timeoutMs, "text/html,application/xhtml+xml");
 
     return {
-      url: response.url,
+      url: response.url || url,
       status: response.status,
       ok: response.ok,
       text: await response.text(),
@@ -70,7 +87,7 @@ export class MangabuffHttpSession implements MangabuffSessionClient {
     const response = await this.fetch(url, timeoutMs, "image/avif,image/webp,image/png,image/*,*/*;q=0.8");
 
     return {
-      url: response.url,
+      url: response.url || url,
       status: response.status,
       ok: response.ok,
       bytes: new Uint8Array(await response.arrayBuffer()),
@@ -86,9 +103,10 @@ export class MangabuffHttpSession implements MangabuffSessionClient {
       timeoutMs?: number;
     } = {},
   ): Promise<MangabuffJsonResponse> {
-    const response = await this.fetch(url, options.timeoutMs ?? 20_000, "application/json, text/plain, */*", {
-      body: buildFormUrlEncodedBody(data),
-      contentType: "application/x-www-form-urlencoded; charset=UTF-8",
+    const body = buildFormUrlEncodedBody(data);
+    const response = await this.fetch(url, options.timeoutMs ?? 20_000, body ? "application/json, text/plain, */*" : "*/*", {
+      body: body || undefined,
+      contentType: body ? "application/x-www-form-urlencoded; charset=UTF-8" : undefined,
       csrfToken: options.csrfToken,
       method: "POST",
       referer: options.referer,
@@ -97,12 +115,25 @@ export class MangabuffHttpSession implements MangabuffSessionClient {
     const text = await response.text();
 
     return {
-      url: response.url,
+      url: response.url || url,
       status: response.status,
       ok: response.ok,
       json: parseJsonSafely(text),
       text,
     };
+  }
+
+  async saveStorageState(): Promise<boolean> {
+    if (!this.cookiesDirty || !this.storageState || !this.storageStatePath) {
+      return false;
+    }
+
+    this.storageState.cookies = this.cookies;
+    await mkdir(dirname(this.storageStatePath), { recursive: true });
+    await writeFile(this.storageStatePath, `${JSON.stringify(this.storageState, null, 2)}\n`, "utf8");
+    this.cookiesDirty = false;
+
+    return true;
   }
 
   private async fetch(
@@ -214,6 +245,7 @@ export class MangabuffHttpSession implements MangabuffSessionClient {
       if (cookie.expires >= 0 && cookie.expires <= Date.now() / 1_000) {
         if (existingIndex >= 0) {
           this.cookies.splice(existingIndex, 1);
+          this.cookiesDirty = true;
         }
 
         continue;
@@ -224,6 +256,8 @@ export class MangabuffHttpSession implements MangabuffSessionClient {
       } else {
         this.cookies.push(cookie);
       }
+
+      this.cookiesDirty = true;
     }
   }
 }
@@ -232,7 +266,48 @@ export async function openSavedMangabuffHttpSession(
   storageStatePath = mangabuffStorageStatePath,
 ): Promise<MangabuffHttpSession> {
   const state = JSON.parse(await readFile(storageStatePath, "utf8")) as StorageState;
-  return new MangabuffHttpSession(state.cookies);
+  return new MangabuffHttpSession(state.cookies, state, storageStatePath);
+}
+
+export async function autoLoginMangabuffHttpSession(options: MangabuffHttpAutoLoginOptions): Promise<boolean> {
+  const storageStatePath = options.storageStatePath ?? mangabuffStorageStatePath;
+  const storageState: StorageState = {
+    cookies: [],
+    origins: [{ localStorage: [], origin: "https://mangabuff.ru" }],
+  };
+  const session = new MangabuffHttpSession(storageState.cookies, storageState, storageStatePath);
+  const loginPage = await session.getText(mangabuffLoginUrl);
+  const csrfToken = extractCsrfToken(loginPage.text);
+
+  if (!loginPage.ok || !csrfToken) {
+    return false;
+  }
+
+  const loginResponse = await session.postForm(
+    mangabuffLoginUrl,
+    {
+      email: options.login,
+      password: options.password,
+    },
+    {
+      csrfToken,
+      referer: mangabuffLoginUrl,
+    },
+  );
+
+  if (!loginResponse.ok) {
+    return false;
+  }
+
+  const tradesPage = await session.getText(mangabuffTradesUrl);
+
+  if (!isMangabuffAuthorizedHttpResponse(tradesPage)) {
+    return false;
+  }
+
+  await session.saveStorageState();
+
+  return true;
 }
 
 export async function checkSavedMangabuffHttpSession(
@@ -251,6 +326,8 @@ export async function checkSavedMangabuffHttpSession(
   }
 
   const response = await session.getText(mangabuffTradesUrl);
+  await session.saveStorageState();
+
   return isMangabuffAuthorizedHttpResponse(response);
 }
 
@@ -363,6 +440,12 @@ function parseSetCookieHeader(header: string, responseUrl: URL): StorageStateCoo
       cookie.domain = attributeValue.trim().replace(/^\./, "");
     } else if (attributeName === "path" && attributeValue) {
       cookie.path = attributeValue.trim();
+    } else if (attributeName === "httponly") {
+      cookie.httpOnly = true;
+    } else if (attributeName === "secure") {
+      cookie.secure = true;
+    } else if (attributeName === "samesite" && attributeValue) {
+      cookie.sameSite = normalizeSameSite(attributeValue);
     } else if (attributeName === "expires" && attributeValue) {
       const expires = Date.parse(attributeValue);
 
@@ -379,6 +462,24 @@ function parseSetCookieHeader(header: string, responseUrl: URL): StorageStateCoo
   }
 
   return cookie;
+}
+
+function normalizeSameSite(value: string): "Strict" | "Lax" | "None" | undefined {
+  const normalized = value.trim().toLowerCase();
+
+  if (normalized === "strict") {
+    return "Strict";
+  }
+
+  if (normalized === "none") {
+    return "None";
+  }
+
+  if (normalized === "lax") {
+    return "Lax";
+  }
+
+  return undefined;
 }
 
 function defaultCookiePath(pathname: string): string {
@@ -500,4 +601,11 @@ function htmlToText(html: string): string {
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
+}
+
+function extractCsrfToken(html: string): string | undefined {
+  return (
+    html.match(/<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i)?.[1] ??
+    html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']csrf-token["']/i)?.[1]
+  );
 }
