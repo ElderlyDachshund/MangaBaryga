@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { mangabuffLoginUrl, mangabuffStorageStatePath, mangabuffTradesUrl } from "./browser.js";
+import { logInfo, logWarn } from "./logger.js";
 
 interface StorageStateCookie {
   name: string;
@@ -190,7 +191,13 @@ export class MangabuffHttpSession implements MangabuffSessionClient {
     this.storeResponseCookies(response, url);
 
     if (response.status === 429) {
-      await sleep(readRetryAfterMs(response) ?? defaultRateLimitRetryMs);
+      const retryAfterMs = readRetryAfterMs(response) ?? defaultRateLimitRetryMs;
+      logWarn("Mangabuff rate limit response received", {
+        retryAfterMs,
+        status: response.status,
+        url,
+      });
+      await sleep(retryAfterMs);
     }
 
     return response;
@@ -276,10 +283,18 @@ export async function autoLoginMangabuffHttpSession(options: MangabuffHttpAutoLo
     origins: [{ localStorage: [], origin: "https://mangabuff.ru" }],
   };
   const session = new MangabuffHttpSession(storageState.cookies, storageState, storageStatePath);
+
+  logInfo("Mangabuff HTTP auto-login started", { storageStatePath });
+
   const loginPage = await session.getText(mangabuffLoginUrl);
   const csrfToken = extractCsrfToken(loginPage.text);
 
   if (!loginPage.ok || !csrfToken) {
+    logWarn("Mangabuff HTTP auto-login could not read login page", {
+      hasCsrfToken: Boolean(csrfToken),
+      status: loginPage.status,
+      url: loginPage.url,
+    });
     return false;
   }
 
@@ -296,16 +311,25 @@ export async function autoLoginMangabuffHttpSession(options: MangabuffHttpAutoLo
   );
 
   if (!loginResponse.ok) {
+    logWarn("Mangabuff HTTP auto-login POST failed", {
+      status: loginResponse.status,
+      url: loginResponse.url,
+    });
     return false;
   }
 
   const tradesPage = await session.getText(mangabuffTradesUrl);
 
   if (!isMangabuffAuthorizedHttpResponse(tradesPage)) {
+    logWarn("Mangabuff HTTP auto-login did not produce authorized session", {
+      status: tradesPage.status,
+      url: tradesPage.url,
+    });
     return false;
   }
 
   await session.saveStorageState();
+  logInfo("Mangabuff HTTP auto-login saved authorized session", { storageStatePath });
 
   return true;
 }
@@ -319,6 +343,7 @@ export async function checkSavedMangabuffHttpSession(
     session = await openSavedMangabuffHttpSession(storageStatePath);
   } catch (error) {
     if (isFileMissingError(error)) {
+      logWarn("Saved Mangabuff HTTP session file is missing", { storageStatePath });
       return false;
     }
 
@@ -328,7 +353,14 @@ export async function checkSavedMangabuffHttpSession(
   const response = await session.getText(mangabuffTradesUrl);
   await session.saveStorageState();
 
-  return isMangabuffAuthorizedHttpResponse(response);
+  const authorized = isMangabuffAuthorizedHttpResponse(response);
+  logInfo("Saved Mangabuff HTTP session checked", {
+    authorized,
+    status: response.status,
+    url: response.url,
+  });
+
+  return authorized;
 }
 
 export function isMangabuffAuthorizedHttpResponse(response: MangabuffTextResponse): boolean {

@@ -3,17 +3,19 @@ import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   cancelMangabuffManualAuth,
   completeMangabuffManualAuth,
   mangabuffTradesUrl,
+  mangabuffStorageStatePath,
   startMangabuffManualAuth,
   type ManualAuthSession,
 } from "./browser.js";
 import { listTrades, loadSettings, openDatabase, saveSettingsPatch, type AppDatabase } from "./db.js";
 import type { BotSettings } from "./domain.js";
+import { formatError, logError, logInfo, logWarn } from "./logger.js";
 import { autoLoginMangabuffHttpSession, checkSavedMangabuffHttpSession } from "./mangabuff-http.js";
 import { runVisibleTradesLoop, type TradesPassResult } from "./trades.js";
 import { assertTelegramConfigured } from "./telegram.js";
@@ -50,6 +52,8 @@ export function startControlServer(port = readPort()): void {
   const hostname = readHostname();
   const app = createControlApp();
 
+  void logStartupDiagnostics(hostname, port);
+
   serve(
     {
       fetch: app.fetch,
@@ -58,19 +62,21 @@ export function startControlServer(port = readPort()): void {
     },
     () => {
       const displayHostname = hostname === "0.0.0.0" ? "127.0.0.1" : hostname;
-      console.log(`Панель управления: http://${displayHostname}:${port}`);
+      logInfo("Control server listening", {
+        hostname,
+        port,
+        url: `http://${displayHostname}:${port}`,
+      });
     },
   );
 
   if (process.env.AUTO_START_BOT === "true") {
-    console.log("Автозапуск бота включён.");
+    logInfo("Bot autostart enabled");
     void startBot(db).catch((error) => {
-      console.error(
-        `Не удалось автоматически запустить бота: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      logError("Bot autostart failed", { error: formatError(error) });
     });
   } else {
-    console.log("Автозапуск бота выключен: AUTO_START_BOT не равно true.");
+    logInfo("Bot autostart disabled", { AUTO_START_BOT: process.env.AUTO_START_BOT });
   }
 
   startAutoLoginRefreshLoop();
@@ -80,8 +86,15 @@ function createControlApp(): Hono {
   const app = new Hono();
   const webOrigins = readWebOrigins();
 
-  app.onError((error) => {
+  app.onError((error, context) => {
     const statusCode = error instanceof HttpError ? error.statusCode : 500;
+
+    logError("HTTP request failed", {
+      error: error instanceof Error ? error.message : String(error),
+      method: context.req.method,
+      path: new URL(context.req.url).pathname,
+      statusCode,
+    });
 
     return jsonResponse(
       {
@@ -167,15 +180,27 @@ function createControlApp(): Hono {
 
 async function startBot(db: AppDatabase): Promise<void> {
   if (runtime.running) {
+    logInfo("Bot start skipped because loop is already running");
     return;
   }
 
   const settings = loadRuntimeSettings(db);
+  logInfo("Bot start requested", {
+    autoAcceptEnabled: settings.autoAcceptEnabled,
+    browserMode: settings.browserMode,
+    loopPauseMs: settings.loopPauseMs,
+    maxWantedPagesExclusive: settings.maxWantedPagesExclusive,
+    safeMode: settings.safeMode,
+    telegramConfigured: Boolean(settings.telegramBotToken && settings.telegramChatId),
+  });
+
   assertTelegramConfigured(settings);
 
+  logInfo("Checking saved Mangabuff HTTP session");
   const authorized = await checkSavedMangabuffHttpSession();
 
   if (!authorized) {
+    logWarn("Saved Mangabuff HTTP session is not authorized");
     throw new HttpError(400, "Нужна авторизация Mangabuff.");
   }
 
@@ -186,21 +211,28 @@ async function startBot(db: AppDatabase): Promise<void> {
   runtime.stoppedAt = undefined;
   runtime.lastError = undefined;
 
+  logInfo("Bot loop started", { startedAt: runtime.startedAt });
   void runVisibleTradesLoop(db, settings, {
     getSettings: () => loadRuntimeSettings(db),
     signal: botAbortController.signal,
     onPass: (result) => {
       runtime.lastPass = result;
+      logTradesPass(result);
     },
   })
     .catch((error) => {
-      runtime.lastError = error instanceof Error ? error.message : String(error);
+      runtime.lastError = formatError(error);
+      logError("Bot loop failed", { error: runtime.lastError });
     })
     .finally(() => {
       runtime.running = false;
       runtime.stopping = false;
       runtime.stoppedAt = new Date().toISOString();
       botAbortController = undefined;
+      logInfo("Bot loop stopped", {
+        lastError: runtime.lastError,
+        stoppedAt: runtime.stoppedAt,
+      });
     });
 }
 
@@ -208,10 +240,12 @@ function stopBot(): void {
   if (!botAbortController) {
     runtime.running = false;
     runtime.stopping = false;
+    logInfo("Bot stop skipped because loop is not running");
     return;
   }
 
   runtime.stopping = true;
+  logInfo("Bot stop requested");
   botAbortController.abort();
 }
 
@@ -476,6 +510,9 @@ function startAutoLoginRefreshLoop(): void {
   const intervalHours = readAutoLoginIntervalHours();
 
   if (!intervalHours) {
+    logInfo("Mangabuff auto-login refresh disabled", {
+      MANGABUFF_AUTO_LOGIN_INTERVAL_HOURS: process.env.MANGABUFF_AUTO_LOGIN_INTERVAL_HOURS,
+    });
     return;
   }
 
@@ -483,9 +520,10 @@ function startAutoLoginRefreshLoop(): void {
   const password = process.env.MANGABUFF_PASSWORD?.trim();
 
   if (!login || !password) {
-    console.warn(
-      "Автообновление авторизации Mangabuff выключено: нужны MANGABUFF_LOGIN и MANGABUFF_PASSWORD.",
-    );
+    logWarn("Mangabuff auto-login refresh disabled because credentials are missing", {
+      hasLogin: Boolean(login),
+      hasPassword: Boolean(password),
+    });
     return;
   }
 
@@ -496,7 +534,7 @@ function startAutoLoginRefreshLoop(): void {
     }, intervalMs);
   };
 
-  console.log(`Автологин Mangabuff будет запускаться каждые ${intervalHours} ч.`);
+  logInfo("Mangabuff auto-login refresh scheduled", { intervalHours });
   scheduleNext();
 }
 
@@ -509,6 +547,8 @@ async function runAutoLoginRefresh(login: string, password: string): Promise<voi
   const shouldRestartBot = runtime.running;
 
   try {
+    logInfo("Mangabuff auto-login refresh started", { shouldRestartBot });
+
     if (shouldRestartBot) {
       stopBot();
       await waitForBotStopped();
@@ -517,19 +557,87 @@ async function runAutoLoginRefresh(login: string, password: string): Promise<voi
     const saved = await autoLoginMangabuffHttpSession({ login, password });
 
     const time = new Date().toLocaleString("ru-RU");
-    console.log(
-      saved
-        ? `[${time}] Автологин Mangabuff выполнен, сессия сохранена.`
-        : `[${time}] Автологин Mangabuff не подтвердил авторизацию.`,
-    );
+    logInfo("Mangabuff auto-login refresh finished", {
+      saved,
+      time,
+    });
 
     if (saved && shouldRestartBot) {
       await startBot(db);
     }
   } catch (error) {
-    console.error(`Ошибка автологина Mangabuff: ${error instanceof Error ? error.message : String(error)}`);
+    logError("Mangabuff auto-login refresh failed", { error: formatError(error) });
   } finally {
     autoLoginRefreshRunning = false;
+  }
+}
+
+function logTradesPass(result: TradesPassResult): void {
+  if (result.status === "auth_required") {
+    logWarn("Bot pass requires Mangabuff authorization", {
+      passNumber: result.passNumber,
+      reason: result.reason,
+    });
+    return;
+  }
+
+  if (result.status === "temporary_error") {
+    logWarn("Bot pass finished with a temporary error", {
+      passNumber: result.passNumber,
+      reason: result.reason,
+    });
+    return;
+  }
+
+  logInfo("Bot pass finished", {
+    acceptedCount: result.acceptedCount,
+    checkErrorCount: result.checkErrorCount,
+    insertedCount: result.insertedCount,
+    manualReviewCount: result.manualReviewCount,
+    pageStaleCount: result.pageStaleCount,
+    parsedCount: result.parsedCount,
+    pagesCheckedCount: result.pagesCheckedCount,
+    passNumber: result.passNumber,
+    processedCount: result.processedCount,
+    ranksCheckedCount: result.ranksCheckedCount,
+    rulesDroppedCount: result.rulesDroppedCount,
+    safeAcceptCount: result.safeAcceptCount,
+    skippedCount: result.skippedCount,
+    staleCount: result.staleCount,
+    visibleCount: result.visibleTrades.length,
+  });
+}
+
+async function logStartupDiagnostics(hostname: string, port: number): Promise<void> {
+  const webOrigins = readWebOrigins();
+  const databasePath = process.env.DATABASE_PATH ?? process.env.DB_PATH ?? "data/baryga-manga.sqlite";
+  const storageStateExists = await fileExists(mangabuffStorageStatePath);
+
+  logInfo("Startup diagnostics", {
+    AUTO_START_BOT: process.env.AUTO_START_BOT,
+    HOST: hostname,
+    NODE_ENV: process.env.NODE_ENV,
+    PORT: port,
+    WEB_ORIGIN: Array.isArray(webOrigins) ? webOrigins.join(",") : webOrigins,
+    databasePath,
+    hasMangabuffLogin: Boolean(process.env.MANGABUFF_LOGIN?.trim()),
+    hasMangabuffPassword: Boolean(process.env.MANGABUFF_PASSWORD?.trim()),
+    isVercel: process.env.VERCEL === "1" || process.env.VERCEL === "true",
+    mangabuffStorageStatePath,
+    mangabuffStorageStateExists: storageStateExists,
+    telegramBotTokenConfigured: Boolean(
+      readFirstOptionalEnv(["MANGA_TELEGRAM_BOT_TOKEN", "APP_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"]),
+    ),
+    telegramChatIdConfigured: Boolean(readFirstOptionalEnv(["MANGA_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID"])),
+  });
+}
+
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
   }
 }
 

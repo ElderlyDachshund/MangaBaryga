@@ -2,6 +2,7 @@ import "dotenv/config";
 import { createDefaultSettings, type TradeCard, type TradeRecord } from "./domain.js";
 import { openSavedMangabuffSession, saveMangabuffSession } from "./browser.js";
 import { listTrades, openDatabase } from "./db.js";
+import { formatError, logError, logInfo } from "./logger.js";
 import { autoLoginMangabuffHttpSession, checkSavedMangabuffHttpSession } from "./mangabuff-http.js";
 import { verifyRankSamples } from "./ranks.js";
 import { startControlServer } from "./server.js";
@@ -10,6 +11,7 @@ import { assertTelegramConfigured } from "./telegram.js";
 
 const settings = createDefaultSettings();
 const command = process.argv[2];
+installProcessErrorLogging();
 applyCliSettings();
 
 switch (command) {
@@ -142,6 +144,11 @@ switch (command) {
   }
 
   case "serve": {
+    logInfo("Starting control server command", {
+      command,
+      cwd: process.cwd(),
+      nodeEnv: process.env.NODE_ENV,
+    });
     startControlServer();
     break;
   }
@@ -299,4 +306,16 @@ function assertAutoAcceptIsSafe(): void {
   if (settings.safeMode) {
     throw new Error("Автоматическое принятие несовместимо с безопасным режимом.");
   }
+}
+
+function installProcessErrorLogging(): void {
+  process.on("unhandledRejection", (reason) => {
+    logError("Unhandled promise rejection", { error: formatError(reason) });
+    process.exit(1);
+  });
+
+  process.on("uncaughtException", (error) => {
+    logError("Uncaught exception", { error: formatError(error) });
+    process.exit(1);
+  });
 }
