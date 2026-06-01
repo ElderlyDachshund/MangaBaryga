@@ -1627,7 +1627,9 @@ function extractVisibleTradeLinksFromHtml(html: string): VisibleTrade[] {
 }
 
 function addVisibleTradesFromHtml(tradesById: Map<string, VisibleTrade>, html: string): void {
-  for (const match of html.matchAll(/href=["']([^"']*\/trades\/(\d+)[^"']*)["']/gi)) {
+  const visibleHtml = removeClearlyHiddenHtml(html);
+
+  for (const match of visibleHtml.matchAll(/href=["']([^"']*\/trades\/(\d+)[^"']*)["']/gi)) {
     const tradeId = match[2];
 
     tradesById.set(tradeId, {
@@ -1635,6 +1637,26 @@ function addVisibleTradesFromHtml(tradesById: Map<string, VisibleTrade>, html: s
       tradeUrl: `https://mangabuff.ru/trades/${tradeId}`,
     });
   }
+}
+
+function removeClearlyHiddenHtml(html: string): string {
+  let visibleHtml = html
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
+    .replace(/<template\b[\s\S]*?<\/template>/gi, " ");
+
+  let previousHtml: string;
+
+  do {
+    previousHtml = visibleHtml;
+    visibleHtml = visibleHtml.replace(
+      /<([a-z][\w:-]*)\b(?=[^>]*(?:\bhidden\b|\baria-hidden\s*=\s*["']?true|\bstyle\s*=\s*["'][^"']*display\s*:\s*none|\bclass\s*=\s*["'][^"']*(?:\bd-none\b|\bhidden\b|\bis-hidden\b|\btab-pane\b(?![^"']*\bactive\b))))[^>]*>[\s\S]*?<\/\1>/gi,
+      " ",
+    );
+  } while (visibleHtml !== previousHtml);
+
+  return visibleHtml;
 }
 
 async function extractVisibleTradeLinks(page: Page): Promise<VisibleTrade[]> {

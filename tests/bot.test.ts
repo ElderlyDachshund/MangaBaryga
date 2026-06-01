@@ -816,6 +816,65 @@ test("HTTP scan reads paginated visible trades beyond the first page", async () 
   });
 });
 
+test("HTTP scan ignores trade links from hidden inactive HTML blocks", async () => {
+  await withDatabase(async (db) => {
+    const session = new FakeHttpSession();
+    const requestedImage = await createRankImage(0.56, 0.8, 0.3);
+    const offeredImage = await createRankImage(0.09, 0.8, 0.35);
+
+    insertNewTrade(db, "1001", "https://mangabuff.ru/trades/1001");
+    updateTradeStatus(db, "1001", "требует_ручной_проверки", "Старая ручная проверка.");
+    markTradeTelegramSent(db, "1001");
+
+    session.queueText(
+      tradesUrl,
+      htmlResponse(
+        tradesUrl,
+        `
+          <html>
+            <body>
+              <nav>Предложения Отправленные</nav>
+              <div class="tab-pane">
+                <a href="/trades/1001">Старый обмен в неактивной вкладке</a>
+              </div>
+              <div style="display: none">
+                <a href="/trades/1002">Старый скрытый обмен</a>
+              </div>
+              <template>
+                <a href="/trades/1003">Шаблон обмена</a>
+              </template>
+              <div class="tab-pane active">
+                <a href="/trades/1006">Новый видимый обмен</a>
+              </div>
+            </body>
+          </html>
+        `,
+      ),
+    );
+    session.queueText(
+      "https://mangabuff.ru/trades/1006",
+      htmlResponse("https://mangabuff.ru/trades/1006", activeTradeHtml({ tradeId: "1006" })),
+    );
+    session.queueText(
+      "https://mangabuff.ru/cards/201/offers/want",
+      htmlResponse("https://mangabuff.ru/cards/201/offers/want", wantedUsersHtml(1)),
+    );
+    session.setBytes("https://mangabuff.ru/img/cards/requested-d.png", requestedImage);
+    session.setBytes("https://mangabuff.ru/img/cards/offered-c.png", offeredImage);
+
+    const result = await scanVisibleTradesInHttpSession(db, session, createDefaultSettings());
+
+    assert.deepEqual(
+      result.visibleTrades.map((trade) => trade.tradeId),
+      ["1006"],
+    );
+    assert.equal(result.insertedCount, 1);
+    assert.equal(result.processedCount, 1);
+    assert.equal(result.skippedCount, 0);
+    assert.equal(findTradeById(db, "1006")?.status, "бот_бы_принял");
+  });
+});
+
 test("HTTP scan treats Mangabuff 505 as a temporary pass failure", async () => {
   await withDatabase(async (db) => {
     const session = new FakeHttpSession();
