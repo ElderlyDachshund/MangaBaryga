@@ -16,7 +16,7 @@ RUN if [ "$INSTALL_PLAYWRIGHT" = "true" ]; then node node_modules/playwright/cli
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
 ENV PORT=3000
-ENV AUTO_START_BOT=false
+ENV AUTO_START_BOT=true
 ENV DATABASE_PATH=/app/data/baryga-manga.sqlite
 ENV MANGABUFF_STORAGE_STATE_PATH=/app/data/mangabuff.json
 

@@ -63,11 +63,14 @@ export function startControlServer(port = readPort()): void {
   );
 
   if (process.env.AUTO_START_BOT === "true") {
+    console.log("Автозапуск бота включён.");
     void startBot(db).catch((error) => {
       console.error(
         `Не удалось автоматически запустить бота: ${error instanceof Error ? error.message : String(error)}`,
       );
     });
+  } else {
+    console.log("Автозапуск бота выключен: AUTO_START_BOT не равно true.");
   }
 
   startAutoLoginRefreshLoop();
