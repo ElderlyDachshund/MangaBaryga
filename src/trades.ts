@@ -39,6 +39,7 @@ import { sendAuthRequiredNotification, sendTradeProblemNotification } from "./te
 const tradePassTimeoutMs = readIntegerEnv("MANGABUFF_TRADE_PASS_TIMEOUT_MS", 600_000, 45_000, 3_600_000);
 const tradePauseMinMs = readIntegerEnv("MANGABUFF_TRADE_PAUSE_MIN_MS", 6_000, 0, 60_000);
 const tradePauseMaxMs = readIntegerEnv("MANGABUFF_TRADE_PAUSE_MAX_MS", 10_000, 0, 60_000);
+const tradeListMaxPages = readIntegerEnv("MANGABUFF_TRADE_LIST_MAX_PAGES", 10, 1, 50);
 
 export interface VisibleTrade {
   tradeId: string;
@@ -62,6 +63,7 @@ export interface ScanTradesResult {
   skippedCount: number;
   skippedStatusSummary?: string;
   skippedTradeIds?: string;
+  visibleTradePageCount?: number;
 }
 
 export interface TradesLoopOptions {
@@ -197,17 +199,7 @@ export async function scanVisibleTradesInHttpSession(
   session: MangabuffSessionClient,
   settings: BotSettingsSource,
 ): Promise<ScanTradesResult> {
-  const tradesPage = await session.getText(mangabuffTradesUrl);
-
-  if (tradesPage.status === 505 || htmlToText(tradesPage.text)?.includes("505")) {
-    throw new Error("Mangabuff вернул ошибку 505 при загрузке вкладки предложений.");
-  }
-
-  if (!isMangabuffAuthorizedHttpResponse(tradesPage)) {
-    throw new Error("Нужна авторизация Mangabuff.");
-  }
-
-  const visibleTrades = extractVisibleTradeLinksFromHtml(tradesPage.text);
+  const { pageCount: visibleTradePageCount, visibleTrades } = await scanVisibleTradeLinksInHttpSession(session);
   let insertedCount = 0;
 
   for (const trade of visibleTrades) {
@@ -272,7 +264,50 @@ export async function scanVisibleTradesInHttpSession(
     ...processingStats,
     skippedStatusSummary: formatSkippedStatusSummary(skippedStats),
     skippedTradeIds: formatSkippedTradeIds(skippedStats),
+    visibleTradePageCount,
   };
+}
+
+async function scanVisibleTradeLinksInHttpSession(
+  session: MangabuffSessionClient,
+): Promise<{ pageCount: number; visibleTrades: VisibleTrade[] }> {
+  const firstPage = await session.getText(mangabuffTradesUrl);
+
+  assertTradesPageReadable(firstPage);
+
+  const pageCount = Math.min(readPaginationPagesCountFromHtml(firstPage.text) ?? 1, tradeListMaxPages);
+  const tradesById = new Map<string, VisibleTrade>();
+
+  addVisibleTradesFromHtml(tradesById, firstPage.text);
+
+  for (let pageNumber = 2; pageNumber <= pageCount; pageNumber += 1) {
+    const page = await session.getText(buildTradesPageUrl(pageNumber));
+
+    assertTradesPageReadable(page);
+    addVisibleTradesFromHtml(tradesById, page.text);
+  }
+
+  return {
+    pageCount,
+    visibleTrades: [...tradesById.values()],
+  };
+}
+
+function assertTradesPageReadable(page: MangabuffTextResponse): void {
+  if (page.status === 505 || htmlToText(page.text)?.includes("505")) {
+    throw new Error("Mangabuff вернул ошибку 505 при загрузке вкладки предложений.");
+  }
+
+  if (!isMangabuffAuthorizedHttpResponse(page)) {
+    throw new Error("Нужна авторизация Mangabuff.");
+  }
+}
+
+function buildTradesPageUrl(pageNumber: number): string {
+  const url = new URL(mangabuffTradesUrl);
+
+  url.searchParams.set("page", String(pageNumber));
+  return url.toString();
 }
 
 async function scanVisibleTradesInSession(
@@ -1587,6 +1622,11 @@ async function clickFirstVisible(locator: Locator): Promise<boolean> {
 function extractVisibleTradeLinksFromHtml(html: string): VisibleTrade[] {
   const tradesById = new Map<string, VisibleTrade>();
 
+  addVisibleTradesFromHtml(tradesById, html);
+  return [...tradesById.values()];
+}
+
+function addVisibleTradesFromHtml(tradesById: Map<string, VisibleTrade>, html: string): void {
   for (const match of html.matchAll(/href=["']([^"']*\/trades\/(\d+)[^"']*)["']/gi)) {
     const tradeId = match[2];
 
@@ -1595,8 +1635,6 @@ function extractVisibleTradeLinksFromHtml(html: string): VisibleTrade[] {
       tradeUrl: `https://mangabuff.ru/trades/${tradeId}`,
     });
   }
-
-  return [...tradesById.values()];
 }
 
 async function extractVisibleTradeLinks(page: Page): Promise<VisibleTrade[]> {
