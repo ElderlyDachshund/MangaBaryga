@@ -603,6 +603,8 @@ function logTradesPass(result: TradesPassResult): void {
     rulesDroppedCount: result.rulesDroppedCount,
     safeAcceptCount: result.safeAcceptCount,
     skippedCount: result.skippedCount,
+    skippedStatusSummary: result.skippedStatusSummary,
+    skippedTradeIds: result.skippedTradeIds,
     staleCount: result.staleCount,
     visibleCount: result.visibleTrades.length,
   });

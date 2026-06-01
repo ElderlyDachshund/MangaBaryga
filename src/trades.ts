@@ -25,7 +25,7 @@ import {
   type MangabuffSessionClient,
   type MangabuffTextResponse,
 } from "./mangabuff-http.js";
-import type { BotSettings, CardRank } from "./domain.js";
+import type { BotSettings, CardRank, TradeStatus } from "./domain.js";
 import { isFinalTradeStatus, type TradeCard, type TradeRecord } from "./domain.js";
 import {
   isSupportedCardRank,
@@ -60,6 +60,8 @@ export interface ScanTradesResult {
   safeAcceptCount: number;
   acceptedCount: number;
   skippedCount: number;
+  skippedStatusSummary?: string;
+  skippedTradeIds?: string;
 }
 
 export interface TradesLoopOptions {
@@ -231,6 +233,7 @@ export async function scanVisibleTradesInHttpSession(
     acceptedCount: 0,
     skippedCount: 0,
   };
+  const skippedStats = createSkippedTradeStats();
 
   for (const [index, trade] of visibleTrades.entries()) {
     const tradeSettings = resolveBotSettings(settings);
@@ -251,6 +254,10 @@ export async function scanVisibleTradesInHttpSession(
     processingStats.acceptedCount += result.outcome === "accepted" ? 1 : 0;
     processingStats.skippedCount += result.outcome === "skipped" ? 1 : 0;
 
+    if (result.outcome === "skipped") {
+      recordSkippedTrade(skippedStats, findTradeById(db, trade.tradeId), trade.tradeId);
+    }
+
     const nextTradeSettings = resolveBotSettings(settings);
 
     if (result.processed && hasLaterProcessableTrade(db, visibleTrades, index, nextTradeSettings, true)) {
@@ -258,7 +265,14 @@ export async function scanVisibleTradesInHttpSession(
     }
   }
 
-  return { visibleTrades, insertedCount, staleCount, ...processingStats };
+  return {
+    visibleTrades,
+    insertedCount,
+    staleCount,
+    ...processingStats,
+    skippedStatusSummary: formatSkippedStatusSummary(skippedStats),
+    skippedTradeIds: formatSkippedTradeIds(skippedStats),
+  };
 }
 
 async function scanVisibleTradesInSession(
@@ -299,6 +313,7 @@ async function scanVisibleTradesInSession(
     acceptedCount: 0,
     skippedCount: 0,
   };
+  const skippedStats = createSkippedTradeStats();
 
   for (const [index, trade] of visibleTrades.entries()) {
     const tradeSettings = resolveBotSettings(settings);
@@ -319,6 +334,10 @@ async function scanVisibleTradesInSession(
     processingStats.acceptedCount += result.outcome === "accepted" ? 1 : 0;
     processingStats.skippedCount += result.outcome === "skipped" ? 1 : 0;
 
+    if (result.outcome === "skipped") {
+      recordSkippedTrade(skippedStats, findTradeById(db, trade.tradeId), trade.tradeId);
+    }
+
     const nextTradeSettings = resolveBotSettings(settings);
 
     if (result.processed && hasLaterProcessableTrade(db, visibleTrades, index, nextTradeSettings, true)) {
@@ -326,7 +345,51 @@ async function scanVisibleTradesInSession(
     }
   }
 
-  return { visibleTrades, insertedCount, staleCount, ...processingStats };
+  return {
+    visibleTrades,
+    insertedCount,
+    staleCount,
+    ...processingStats,
+    skippedStatusSummary: formatSkippedStatusSummary(skippedStats),
+    skippedTradeIds: formatSkippedTradeIds(skippedStats),
+  };
+}
+
+interface SkippedTradeStats {
+  statuses: Partial<Record<TradeStatus | "missing", number>>;
+  tradeIds: string[];
+}
+
+function createSkippedTradeStats(): SkippedTradeStats {
+  return {
+    statuses: {},
+    tradeIds: [],
+  };
+}
+
+function recordSkippedTrade(stats: SkippedTradeStats, record: TradeRecord | undefined, tradeId: string): void {
+  const status = record?.status ?? "missing";
+
+  stats.statuses[status] = (stats.statuses[status] ?? 0) + 1;
+  stats.tradeIds.push(tradeId);
+}
+
+function formatSkippedStatusSummary(stats: SkippedTradeStats): string | undefined {
+  const entries = Object.entries(stats.statuses);
+
+  if (entries.length === 0) {
+    return undefined;
+  }
+
+  return entries.map(([status, count]) => `${status}:${count}`).join(",");
+}
+
+function formatSkippedTradeIds(stats: SkippedTradeStats): string | undefined {
+  if (stats.tradeIds.length === 0) {
+    return undefined;
+  }
+
+  return stats.tradeIds.join(",");
 }
 
 function resolveBotSettings(settings: BotSettingsSource): BotSettings {
@@ -948,6 +1011,10 @@ function shouldProcessTrade(
   }
 
   if (record.status === "принят") {
+    return true;
+  }
+
+  if (record.status === "неактуален") {
     return true;
   }
 

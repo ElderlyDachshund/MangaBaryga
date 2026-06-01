@@ -735,6 +735,37 @@ test("missing visible trades mark only new and check-error records as stale", as
   });
 });
 
+test("HTTP scan rechecks a stale trade when it becomes visible again", async () => {
+  await withDatabase(async (db) => {
+    const session = new FakeHttpSession();
+    const requestedImage = await createRankImage(0.56, 0.8, 0.3);
+    const offeredImage = await createRankImage(0.09, 0.8, 0.35);
+
+    insertNewTrade(db, "1007", "https://mangabuff.ru/trades/1007");
+    updateTradeStatus(db, "1007", "неактуален", 'Обмен исчез из вкладки "Предложения".');
+
+    session.queueText(tradesUrl, htmlResponse(tradesUrl, tradesListHtml(["1007"])));
+    session.queueText(
+      "https://mangabuff.ru/trades/1007",
+      htmlResponse("https://mangabuff.ru/trades/1007", activeTradeHtml({ tradeId: "1007" })),
+    );
+    session.queueText(
+      "https://mangabuff.ru/cards/201/offers/want",
+      htmlResponse("https://mangabuff.ru/cards/201/offers/want", wantedUsersHtml(1)),
+    );
+    session.setBytes("https://mangabuff.ru/img/cards/requested-d.png", requestedImage);
+    session.setBytes("https://mangabuff.ru/img/cards/offered-c.png", offeredImage);
+
+    const result = await scanVisibleTradesInHttpSession(db, session, createDefaultSettings());
+    const trade = findTradeById(db, "1007");
+
+    assert.equal(result.processedCount, 1);
+    assert.equal(result.skippedCount, 0);
+    assert.equal(result.safeAcceptCount, 1);
+    assert.equal(trade?.status, "бот_бы_принял");
+  });
+});
+
 test("HTTP scan treats Mangabuff 505 as a temporary pass failure", async () => {
   await withDatabase(async (db) => {
     const session = new FakeHttpSession();
