@@ -38,6 +38,11 @@ class HttpError extends Error {
   }
 }
 
+interface MangabuffCredentials {
+  login: string;
+  password: string;
+}
+
 const webDistDir = join(process.cwd(), "dist", "web");
 const db = openDatabase();
 const runtime: RuntimeState = {
@@ -116,6 +121,7 @@ function createControlApp(): Hono {
   }
 
   app.get("/api/state", (context) => context.json(buildState(db)));
+  app.get("/api/diagnostics", async (context) => context.json(await buildDiagnostics()));
   app.get("/health", (context) => context.json({ ok: true }));
 
   app.patch("/api/settings", async (context) => {
@@ -196,8 +202,7 @@ async function startBot(db: AppDatabase): Promise<void> {
 
   assertTelegramConfigured(settings);
 
-  logInfo("Checking saved Mangabuff HTTP session");
-  const authorized = await checkSavedMangabuffHttpSession();
+  const authorized = await ensureSavedMangabuffSessionAuthorized();
 
   if (!authorized) {
     logWarn("Saved Mangabuff HTTP session is not authorized");
@@ -210,11 +215,14 @@ async function startBot(db: AppDatabase): Promise<void> {
   runtime.startedAt = new Date().toISOString();
   runtime.stoppedAt = undefined;
   runtime.lastError = undefined;
+  runtime.lastPass = undefined;
 
   logInfo("Bot loop started", { startedAt: runtime.startedAt });
+  const loopController = botAbortController;
+
   void runVisibleTradesLoop(db, settings, {
     getSettings: () => loadRuntimeSettings(db),
-    signal: botAbortController.signal,
+    signal: loopController.signal,
     onPass: (result) => {
       runtime.lastPass = result;
       logTradesPass(result);
@@ -224,7 +232,10 @@ async function startBot(db: AppDatabase): Promise<void> {
       runtime.lastError = formatError(error);
       logError("Bot loop failed", { error: runtime.lastError });
     })
-    .finally(() => {
+    .finally(async () => {
+      const shouldAutoRestart =
+        runtime.lastPass?.status === "auth_required" && !runtime.stopping && !loopController.signal.aborted;
+
       runtime.running = false;
       runtime.stopping = false;
       runtime.stoppedAt = new Date().toISOString();
@@ -233,6 +244,10 @@ async function startBot(db: AppDatabase): Promise<void> {
         lastError: runtime.lastError,
         stoppedAt: runtime.stoppedAt,
       });
+
+      if (shouldAutoRestart) {
+        await restartBotAfterAuthRequired(db);
+      }
     });
 }
 
@@ -327,6 +342,34 @@ function buildState(db: AppDatabase): object {
   };
 }
 
+async function buildDiagnostics(): Promise<object> {
+  const databasePath = process.env.DATABASE_PATH ?? process.env.DB_PATH ?? "data/baryga-manga.sqlite";
+  const storageStateExists = await fileExists(mangabuffStorageStatePath);
+  const authorized = storageStateExists ? await checkSavedMangabuffHttpSession().catch(() => false) : false;
+
+  return {
+    autoStartBot: process.env.AUTO_START_BOT === "true",
+    databasePath,
+    databasePathExists: await fileExists(databasePath),
+    host: readHostname(),
+    mangabuff: {
+      authorized,
+      hasLogin: Boolean(process.env.MANGABUFF_LOGIN?.trim()),
+      hasPassword: Boolean(process.env.MANGABUFF_PASSWORD?.trim()),
+      storageStateExists,
+      storageStatePath: mangabuffStorageStatePath,
+    },
+    nodeEnv: process.env.NODE_ENV,
+    port: readPort(),
+    telegram: {
+      chatIdConfigured: Boolean(readFirstOptionalEnv(["MANGA_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID"])),
+      tokenConfigured: Boolean(
+        readFirstOptionalEnv(["MANGA_TELEGRAM_BOT_TOKEN", "APP_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"]),
+      ),
+    },
+  };
+}
+
 function loadRuntimeSettings(db: AppDatabase): BotSettings {
   const settings = loadSettings(db);
   const telegramBotToken = readFirstOptionalEnv([
@@ -335,6 +378,8 @@ function loadRuntimeSettings(db: AppDatabase): BotSettings {
     "TELEGRAM_BOT_TOKEN",
   ]);
   const telegramChatId = readFirstOptionalEnv(["MANGA_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID"]);
+  const safeMode = readOptionalBooleanEnv(["BARYGA_SAFE_MODE", "SAFE_MODE"]);
+  const autoAcceptEnabled = readOptionalBooleanEnv(["BARYGA_AUTO_ACCEPT_ENABLED", "AUTO_ACCEPT_ENABLED"]);
 
   if (telegramBotToken) {
     settings.telegramBotToken = telegramBotToken;
@@ -342,6 +387,14 @@ function loadRuntimeSettings(db: AppDatabase): BotSettings {
 
   if (telegramChatId) {
     settings.telegramChatId = telegramChatId;
+  }
+
+  if (safeMode !== undefined) {
+    settings.safeMode = safeMode;
+  }
+
+  if (autoAcceptEnabled !== undefined) {
+    settings.autoAcceptEnabled = autoAcceptEnabled;
   }
 
   return settings;
@@ -506,6 +559,49 @@ function readFirstOptionalEnv(names: string[]): string | undefined {
   return undefined;
 }
 
+function readOptionalBooleanEnv(names: string[]): boolean | undefined {
+  const rawValue = readFirstOptionalEnv(names);
+
+  if (!rawValue) {
+    return undefined;
+  }
+
+  const value = rawValue.toLowerCase();
+
+  if (["1", "true", "yes", "on"].includes(value)) {
+    return true;
+  }
+
+  if (["0", "false", "no", "off"].includes(value)) {
+    return false;
+  }
+
+  throw new Error(`${names[0]} должен быть true или false.`);
+}
+
+async function ensureSavedMangabuffSessionAuthorized(): Promise<boolean> {
+  logInfo("Checking saved Mangabuff HTTP session");
+
+  if (await checkSavedMangabuffHttpSession()) {
+    return true;
+  }
+
+  const credentials = readMangabuffCredentials();
+
+  if (!credentials) {
+    logWarn("Saved Mangabuff HTTP session is not authorized and auto-login credentials are missing");
+    return false;
+  }
+
+  logWarn("Saved Mangabuff HTTP session is not authorized; trying auto-login");
+
+  if (!(await runMangabuffAutoLogin(credentials, "startup_auth_check"))) {
+    return false;
+  }
+
+  return checkSavedMangabuffHttpSession();
+}
+
 function startAutoLoginRefreshLoop(): void {
   const intervalHours = readAutoLoginIntervalHours();
 
@@ -516,13 +612,12 @@ function startAutoLoginRefreshLoop(): void {
     return;
   }
 
-  const login = process.env.MANGABUFF_LOGIN?.trim();
-  const password = process.env.MANGABUFF_PASSWORD?.trim();
+  const credentials = readMangabuffCredentials();
 
-  if (!login || !password) {
+  if (!credentials) {
     logWarn("Mangabuff auto-login refresh disabled because credentials are missing", {
-      hasLogin: Boolean(login),
-      hasPassword: Boolean(password),
+      hasLogin: Boolean(process.env.MANGABUFF_LOGIN?.trim()),
+      hasPassword: Boolean(process.env.MANGABUFF_PASSWORD?.trim()),
     });
     return;
   }
@@ -530,7 +625,7 @@ function startAutoLoginRefreshLoop(): void {
   const intervalMs = intervalHours * 60 * 60 * 1_000;
   const scheduleNext = () => {
     setTimeout(() => {
-      void runAutoLoginRefresh(login, password).finally(scheduleNext);
+      void runAutoLoginRefresh(credentials).finally(scheduleNext);
     }, intervalMs);
   };
 
@@ -538,12 +633,7 @@ function startAutoLoginRefreshLoop(): void {
   scheduleNext();
 }
 
-async function runAutoLoginRefresh(login: string, password: string): Promise<void> {
-  if (autoLoginRefreshRunning) {
-    return;
-  }
-
-  autoLoginRefreshRunning = true;
+async function runAutoLoginRefresh(credentials: MangabuffCredentials): Promise<void> {
   const shouldRestartBot = runtime.running;
 
   try {
@@ -554,22 +644,72 @@ async function runAutoLoginRefresh(login: string, password: string): Promise<voi
       await waitForBotStopped();
     }
 
-    const saved = await autoLoginMangabuffHttpSession({ login, password });
-
-    const time = new Date().toLocaleString("ru-RU");
-    logInfo("Mangabuff auto-login refresh finished", {
-      saved,
-      time,
-    });
+    const saved = await runMangabuffAutoLogin(credentials, "scheduled_refresh");
 
     if (saved && shouldRestartBot) {
       await startBot(db);
     }
   } catch (error) {
     logError("Mangabuff auto-login refresh failed", { error: formatError(error) });
+  }
+}
+
+async function restartBotAfterAuthRequired(db: AppDatabase): Promise<void> {
+  const credentials = readMangabuffCredentials();
+
+  if (!credentials) {
+    logWarn("Bot stopped because Mangabuff authorization is required; auto-login credentials are missing");
+    return;
+  }
+
+  logWarn("Bot stopped because Mangabuff authorization is required; trying auto-login restart");
+
+  if (!(await runMangabuffAutoLogin(credentials, "auth_required_restart"))) {
+    runtime.lastError = "Автологин Mangabuff не подтвердил авторизацию.";
+    return;
+  }
+
+  await startBot(db);
+}
+
+async function runMangabuffAutoLogin(
+  credentials: MangabuffCredentials,
+  reason: "startup_auth_check" | "scheduled_refresh" | "auth_required_restart",
+): Promise<boolean> {
+  if (autoLoginRefreshRunning) {
+    logInfo("Mangabuff auto-login skipped because another refresh is running", { reason });
+    return false;
+  }
+
+  autoLoginRefreshRunning = true;
+
+  try {
+    logInfo("Mangabuff auto-login started", { reason });
+    const saved = await autoLoginMangabuffHttpSession(credentials);
+    logInfo("Mangabuff auto-login finished", {
+      reason,
+      saved,
+      time: new Date().toLocaleString("ru-RU"),
+    });
+
+    return saved;
+  } catch (error) {
+    logError("Mangabuff auto-login failed", { error: formatError(error), reason });
+    return false;
   } finally {
     autoLoginRefreshRunning = false;
   }
+}
+
+function readMangabuffCredentials(): MangabuffCredentials | undefined {
+  const login = process.env.MANGABUFF_LOGIN?.trim();
+  const password = process.env.MANGABUFF_PASSWORD?.trim();
+
+  if (!login || !password) {
+    return undefined;
+  }
+
+  return { login, password };
 }
 
 function logTradesPass(result: TradesPassResult): void {
@@ -622,6 +762,8 @@ async function logStartupDiagnostics(hostname: string, port: number): Promise<vo
     HOST: hostname,
     NODE_ENV: process.env.NODE_ENV,
     PORT: port,
+    SAFE_MODE: process.env.SAFE_MODE,
+    AUTO_ACCEPT_ENABLED: process.env.AUTO_ACCEPT_ENABLED,
     WEB_ORIGIN: Array.isArray(webOrigins) ? webOrigins.join(",") : webOrigins,
     databasePath,
     hasMangabuffLogin: Boolean(process.env.MANGABUFF_LOGIN?.trim()),

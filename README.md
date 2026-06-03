@@ -35,6 +35,8 @@ Recommended host environment:
 - `MANGABUFF_STORAGE_STATE_PATH=/app/data/mangabuff.json`
 - `DATABASE_PATH=/app/data/baryga-manga.sqlite`
 - `AUTO_START_BOT=true` if the bot should start with the server
+- `MANGABUFF_LOGIN=...` and `MANGABUFF_PASSWORD=...` so the host can refresh an expired Mangabuff session by itself
+- `MANGABUFF_AUTO_LOGIN_INTERVAL_HOURS=20` to refresh the saved session periodically
 - `MANGA_TELEGRAM_BOT_TOKEN=...` (or `TELEGRAM_BOT_TOKEN` on hosts where that name is editable)
 - `TELEGRAM_CHAT_ID=...`
 
@@ -83,3 +85,69 @@ On the Node API host, set:
 `WEB_ORIGIN` may contain multiple allowed frontend origins separated by commas.
 
 If the API host supports Docker, deploy this repo with the included `Dockerfile`.
+
+## Bothost checklist
+
+`http://127.0.0.1:3017` is only the server running on the current computer. Stopping or
+starting the bot there does not control the Bothost process. To keep the bot alive when
+the local computer is off, open the Bothost app URL and make sure that app runs the Node
+server with `AUTO_START_BOT=true`.
+
+The host also needs its own Mangabuff session. Upload the local
+`data/mangabuff.json`/`playwright/.auth/mangabuff.json` to the host path from
+`MANGABUFF_STORAGE_STATE_PATH`, or set `MANGABUFF_LOGIN` and `MANGABUFF_PASSWORD` and
+run `npm run auth:auto` on the host once. If the session expires later, the server will
+try to refresh it and restart the bot automatically when those credentials are present.
+
+If the web panel is deployed separately as a static Vite/Vercel site, build it with
+`VITE_API_BASE_URL` pointing to the Bothost API URL, not to `127.0.0.1`.
+
+## Bothost пошаговый запуск
+
+1. Открой `https://bothost.ru/dashboard.php` и создай новое приложение/бота.
+2. Если в панели есть режим Docker, выбери Docker и загрузи этот репозиторий целиком.
+   В проекте уже есть `Dockerfile`, он собирает сервер и веб-панель.
+3. Если Docker-режима нет, выбери Node.js и укажи команды:
+
+   ```sh
+   npm ci && npm run build
+   npm start
+   ```
+
+4. В переменных окружения Bothost укажи:
+
+   ```env
+   HOST=0.0.0.0
+   PORT=3000
+   NODE_ENV=production
+   AUTO_START_BOT=true
+   DATABASE_PATH=/app/data/baryga-manga.sqlite
+   MANGABUFF_STORAGE_STATE_PATH=/app/data/mangabuff.json
+   MANGABUFF_LOGIN=your_mangabuff_login
+   MANGABUFF_PASSWORD=your_mangabuff_password
+   MANGABUFF_AUTO_LOGIN_INTERVAL_HOURS=20
+   MANGA_TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+   TELEGRAM_CHAT_ID=your_telegram_chat_id
+   SAFE_MODE=false
+   AUTO_ACCEPT_ENABLED=true
+   ```
+
+   Если запускаешь не через Docker и Bothost не даёт доступ к `/app/data`, замени
+   `DATABASE_PATH` на `data/baryga-manga.sqlite`, а `MANGABUFF_STORAGE_STATE_PATH` на
+   `data/mangabuff.json`.
+
+   `SAFE_MODE=false` и `AUTO_ACCEPT_ENABLED=true` включают автоматическое принятие
+   подходящих обменов через переменные окружения. Если их не указывать, режим берётся из
+   сохранённых настроек веб-панели.
+
+5. Запусти или перезапусти приложение в Bothost.
+6. Открой публичный URL приложения из Bothost. Это и будет веб-версия панели. Не используй
+   `http://127.0.0.1:3017` для Bothost: этот адрес относится только к локальному компьютеру.
+7. Проверь `/health` на публичном адресе приложения. Если приложение доступно, endpoint
+   должен отвечать без ошибки.
+8. В панели проверь статус Mangabuff-авторизации и Telegram. Если Mangabuff-сессия не
+   подтянулась, сервер попробует выполнить автологин по `MANGABUFF_LOGIN` и
+   `MANGABUFF_PASSWORD`.
+
+После этого бот должен стартовать сам при запуске Bothost-приложения и продолжать работать,
+когда локальный компьютер выключен.
