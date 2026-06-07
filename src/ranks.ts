@@ -6,7 +6,7 @@ import { rankSamples, type RankSample } from "./rank-samples.js";
 sharp.cache(false);
 sharp.concurrency(1);
 
-interface RankColorFeatures {
+export interface RankColorFeatures {
   hue: number;
   saturation: number;
   lightness: number;
@@ -104,7 +104,7 @@ export async function recognizeCardRankFromImageBytes(bytes: Uint8Array): Promis
   return { rank, features };
 }
 
-function classifyRankByColorFeatures(features: RankColorFeatures): CardRank {
+export function classifyRankByColorFeatures(features: RankColorFeatures): CardRank {
   const { hue, saturation, lightness, coloredPixelRatio } = features;
 
   if (coloredPixelRatio < 0.01) {
@@ -142,7 +142,7 @@ function classifyRankByColorFeatures(features: RankColorFeatures): CardRank {
 
   if (
     (hue <= 0.02 || hue >= 0.985) &&
-    saturation >= 0.7 &&
+    saturation >= 0.58 &&
     isInRange(lightness, 0.29, 0.37) &&
     coloredPixelRatio >= 0.65
   ) {
@@ -151,8 +151,8 @@ function classifyRankByColorFeatures(features: RankColorFeatures): CardRank {
 
   if (
     isInRange(hue, 0.025, 0.055) &&
-    isInRange(saturation, 0.3, 0.65) &&
-    isInRange(lightness, 0.18, 0.25) &&
+    isInRange(saturation, 0.27, 0.65) &&
+    isInRange(lightness, 0.18, 0.27) &&
     coloredPixelRatio >= 0.5
   ) {
     return "E";
