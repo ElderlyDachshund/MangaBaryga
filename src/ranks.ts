@@ -152,7 +152,7 @@ export function classifyRankByColorFeatures(features: RankColorFeatures): CardRa
   if (
     isInRange(hue, 0.025, 0.055) &&
     isInRange(saturation, 0.27, 0.65) &&
-    isInRange(lightness, 0.18, 0.27) &&
+    isInRange(lightness, 0.15, 0.27) &&
     coloredPixelRatio >= 0.5
   ) {
     return "E";
