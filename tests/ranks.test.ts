@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
 import test from "node:test";
 import sharp from "sharp";
 import { classifyRankByColorFeatures, recognizeCardRankFromImageBytes } from "../src/ranks.js";
@@ -25,6 +26,55 @@ test("classifyRankByColorFeatures keeps the widened A threshold for card 356404"
   assert.equal(rank, "A");
 });
 
+test("classifyRankByColorFeatures recognizes the lighter D variant for rejected trades", () => {
+  const samples = [
+    {
+      hue: 0.5870755887003044,
+      saturation: 0.24112497138093697,
+      lightness: 0.7575467396260832,
+      coloredPixelRatio: 0.02670807453416149,
+    },
+    {
+      hue: 0.5844603547396026,
+      saturation: 0.23906830591088785,
+      lightness: 0.7626517273576099,
+      coloredPixelRatio: 0.02608695652173913,
+    },
+    {
+      hue: 0.5814978214279789,
+      saturation: 0.23282370964045207,
+      lightness: 0.7634117647058822,
+      coloredPixelRatio: 0.031055900621118012,
+    },
+  ];
+
+  for (const sample of samples) {
+    assert.equal(classifyRankByColorFeatures(sample), "D");
+  }
+});
+
+test("recognizeCardRankFromImageBytes keeps the lighter D regression for trade 131079 image", async () => {
+  const image = await loadRankFixture("131079.png");
+  const result = await recognizeCardRankFromImageBytes(image);
+
+  assert.equal(result.rank, "D");
+  assert.ok(result.features.lightness >= 0.757);
+  assert.ok(result.features.lightness <= 0.764);
+  assert.ok(result.features.coloredPixelRatio >= 0.025);
+  assert.ok(result.features.coloredPixelRatio <= 0.032);
+});
+
+test("recognizeCardRankFromImageBytes classifies disputed trade images as D", async () => {
+  const fixtures = ["131079.png", "46694.png", "250123.png"];
+
+  for (const fixture of fixtures) {
+    const image = await loadRankFixture(fixture);
+    const result = await recognizeCardRankFromImageBytes(image);
+
+    assert.equal(result.rank, "D");
+  }
+});
+
 test("recognizeCardRankFromImageBytes keeps the lowered E lightness floor for a dark E image", async () => {
   const image = await createRankImage(0.04, 0.35, 0.16);
   const result = await recognizeCardRankFromImageBytes(image);
@@ -47,6 +97,11 @@ async function createRankImage(hue: number, saturation: number, lightness: numbe
     .png()
     .toBuffer();
 
+  return new Uint8Array(buffer);
+}
+
+async function loadRankFixture(fileName: string): Promise<Uint8Array> {
+  const buffer = await fs.readFile(new URL(`./fixtures/ranks/disputed/${fileName}`, import.meta.url));
   return new Uint8Array(buffer);
 }
 
