@@ -416,6 +416,66 @@ test("auto mode accepts a passing exchange through HTTP with CSRF and referer", 
   });
 });
 
+test("auto mode accepts an exchange with the lighter disputed D image through HTTP", async () => {
+  await withDatabase(async (db) => {
+    const session = new FakeHttpSession();
+    const requestedImage = await createRankImage(0.04, 0.35, 0.2);
+    const offeredImage = await loadRankFixture("131079.png");
+    const settings = createAutoAcceptSettings();
+
+    settings.maxWantedPagesExclusive = 10;
+
+    session.queueText(tradesUrl, htmlResponse(tradesUrl, tradesListHtml(["1017"])));
+    session.queueText(
+      "https://mangabuff.ru/trades/1017",
+      htmlResponse(
+        "https://mangabuff.ru/trades/1017",
+        activeTradeHtml({
+          offeredCards: [{ id: "131079", image: "/img/cards/disputed-d.png", title: "Offered disputed D" }],
+          requestedCards: [{ id: "104463", image: "/img/cards/requested-e.png", title: "Requested E" }],
+          tradeId: "1017",
+          csrfToken: "csrf-1017",
+        }),
+      ),
+      htmlResponse(
+        "https://mangabuff.ru/trades/1017",
+        activeTradeHtml({
+          offeredCards: [{ id: "131079", image: "/img/cards/disputed-d.png", title: "Offered disputed D" }],
+          requestedCards: [{ id: "104463", image: "/img/cards/requested-e.png", title: "Requested E" }],
+          tradeId: "1017",
+          csrfToken: "csrf-1017",
+        }),
+      ),
+      htmlResponse("https://mangabuff.ru/trades/1017", "<html><body>Обмен принят</body></html>"),
+    );
+    session.queueText(
+      "https://mangabuff.ru/cards/104463/offers/want",
+      htmlResponse("https://mangabuff.ru/cards/104463/offers/want", wantedUsersHtml(1)),
+    );
+    session.setBytes("https://mangabuff.ru/img/cards/requested-e.png", requestedImage);
+    session.setBytes("https://mangabuff.ru/img/cards/disputed-d.png", offeredImage);
+
+    const result = await scanVisibleTradesInHttpSession(db, session, settings);
+    const trade = findTradeById(db, "1017");
+
+    assert.equal(result.acceptedCount, 1);
+    assert.equal(trade?.status, "принят");
+    assert.equal(trade?.acceptAttempts, 1);
+    assert.equal(trade?.requestedCards[0]?.rank, "E");
+    assert.equal(trade?.offeredCards[0]?.rank, "D");
+    assert.deepEqual(session.posts, [
+      {
+        data: {},
+        options: {
+          csrfToken: "csrf-1017",
+          referer: "https://mangabuff.ru/trades/1017",
+        },
+        url: "https://mangabuff.ru/trades/1017/accept",
+      },
+    ]);
+  });
+});
+
 test("auto mode accepts a previously safe-passed visible exchange through HTTP", async () => {
   await withDatabase(async (db) => {
     const session = new FakeHttpSession();
@@ -1192,6 +1252,11 @@ async function createRankImage(hue: number, saturation: number, lightness: numbe
     .png()
     .toBuffer();
 
+  return new Uint8Array(buffer);
+}
+
+async function loadRankFixture(fileName: string): Promise<Uint8Array> {
+  const buffer = await readFile(new URL(`./fixtures/ranks/disputed/${fileName}`, import.meta.url));
   return new Uint8Array(buffer);
 }
 
