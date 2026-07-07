@@ -17,6 +17,7 @@ import { listTrades, loadSettings, openDatabase, saveSettingsPatch, type AppData
 import type { BotSettings } from "./domain.js";
 import { formatError, logError, logInfo, logWarn } from "./logger.js";
 import { autoLoginMangabuffHttpSession, checkSavedMangabuffHttpSession } from "./mangabuff-http.js";
+import { readMangabuffProxyUrl } from "./proxy.js";
 import { runVisibleTradesLoop, type TradesPassResult } from "./trades.js";
 import { assertTelegramConfigured } from "./telegram.js";
 
@@ -356,6 +357,7 @@ async function buildDiagnostics(): Promise<object> {
       authorized,
       hasLogin: Boolean(process.env.MANGABUFF_LOGIN?.trim()),
       hasPassword: Boolean(process.env.MANGABUFF_PASSWORD?.trim()),
+      proxyConfigured: Boolean(readMangabuffProxyUrl()),
       storageStateExists,
       storageStatePath: mangabuffStorageStatePath,
     },
@@ -768,6 +770,7 @@ async function logStartupDiagnostics(hostname: string, port: number): Promise<vo
     databasePath,
     hasMangabuffLogin: Boolean(process.env.MANGABUFF_LOGIN?.trim()),
     hasMangabuffPassword: Boolean(process.env.MANGABUFF_PASSWORD?.trim()),
+    hasMangabuffProxy: Boolean(readMangabuffProxyUrl()),
     isVercel: process.env.VERCEL === "1" || process.env.VERCEL === "true",
     mangabuffStorageStatePath,
     mangabuffStorageStateExists: storageStateExists,

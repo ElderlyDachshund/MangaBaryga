@@ -36,6 +36,7 @@ Recommended host environment:
 - `DATABASE_PATH=/app/data/baryga-manga.sqlite`
 - `AUTO_START_BOT=true` if the bot should start with the server
 - `MANGABUFF_LOGIN=...` and `MANGABUFF_PASSWORD=...` so the host can refresh an expired Mangabuff session by itself
+- `MANGABUFF_PROXY_URL=socks5://user:pass@proxy-host:proxy-port` if this bot should use its own proxy/IP
 - `MANGABUFF_AUTO_LOGIN_INTERVAL_HOURS=20` to refresh the saved session periodically
 - `MANGA_TELEGRAM_BOT_TOKEN=...` (or `TELEGRAM_BOT_TOKEN` on hosts where that name is editable)
 - `TELEGRAM_CHAT_ID=...`
@@ -125,6 +126,7 @@ If the web panel is deployed separately as a static Vite/Vercel site, build it w
    MANGABUFF_STORAGE_STATE_PATH=/app/data/mangabuff.json
    MANGABUFF_LOGIN=your_mangabuff_login
    MANGABUFF_PASSWORD=your_mangabuff_password
+   MANGABUFF_PROXY_URL=socks5://user:pass@proxy-host:proxy-port
    MANGABUFF_AUTO_LOGIN_INTERVAL_HOURS=20
    MANGA_TELEGRAM_BOT_TOKEN=your_telegram_bot_token
    TELEGRAM_CHAT_ID=your_telegram_chat_id
@@ -151,3 +153,18 @@ If the web panel is deployed separately as a static Vite/Vercel site, build it w
 
 После этого бот должен стартовать сам при запуске Bothost-приложения и продолжать работать,
 когда локальный компьютер выключен.
+
+## Proxy per bot
+
+If you want different bots to use different IPs, run them as separate Bothost apps and assign a separate `MANGABUFF_PROXY_URL` to each one.
+
+Each bot should still keep its own:
+
+- `DATABASE_PATH`
+- `MANGABUFF_STORAGE_STATE_PATH`
+- `MANGABUFF_LOGIN`
+- `MANGABUFF_PASSWORD`
+- `MANGA_TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+
+`MANGABUFF_PROXY_URL` is used for both the lightweight HTTP Mangabuff session checks and Playwright browser sessions. Supported formats are `http://...`, `https://...`, and `socks5://...`.

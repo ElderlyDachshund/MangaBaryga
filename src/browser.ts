@@ -4,6 +4,7 @@ import { createInterface } from "node:readline/promises";
 import { dirname } from "node:path";
 import { stdin as input, stdout as output } from "node:process";
 import type { BotSettings } from "./domain.js";
+import { readBrowserProxySettings } from "./proxy.js";
 
 export const mangabuffTradesUrl = "https://mangabuff.ru/trades";
 export const mangabuffLoginUrl = "https://mangabuff.ru/login";
@@ -172,6 +173,7 @@ async function openMangabuffBrowser(options: {
   const browser = await chromium.launch({
     args: ["--disable-dev-shm-usage", "--no-sandbox"],
     headless: options.headless,
+    proxy: readBrowserProxySettings(),
   });
   const context = await browser.newContext({
     storageState:

@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { mangabuffLoginUrl, mangabuffStorageStatePath, mangabuffTradesUrl } from "./browser.js";
 import { logInfo, logWarn } from "./logger.js";
+import { proxyAwareFetch, readMangabuffProxyUrl } from "./proxy.js";
 
 interface StorageStateCookie {
   name: string;
@@ -180,7 +181,7 @@ export class MangabuffHttpSession implements MangabuffSessionClient {
       headers["x-requested-with"] = "XMLHttpRequest";
     }
 
-    const response = await fetch(url, {
+    const response = await proxyAwareFetch(url, {
       body: options.body,
       headers,
       method: options.method ?? "GET",
@@ -284,7 +285,10 @@ export async function autoLoginMangabuffHttpSession(options: MangabuffHttpAutoLo
   };
   const session = new MangabuffHttpSession(storageState.cookies, storageState, storageStatePath);
 
-  logInfo("Mangabuff HTTP auto-login started", { storageStatePath });
+  logInfo("Mangabuff HTTP auto-login started", {
+    proxyConfigured: Boolean(readMangabuffProxyUrl()),
+    storageStatePath,
+  });
 
   const loginPage = await session.getText(mangabuffLoginUrl);
   const csrfToken = extractCsrfToken(loginPage.text);
