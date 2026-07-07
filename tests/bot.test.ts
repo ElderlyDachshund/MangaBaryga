@@ -230,6 +230,76 @@ test("HTTP auto-login posts credentials with page CSRF and saves verified cookie
   }
 });
 
+test("HTTP auto-login retries after a 419 login POST and succeeds on the next attempt", async () => {
+  const originalFetch = globalThis.fetch;
+  const tempDir = await mkdtemp(join(tmpdir(), "mangabuff-auth-"));
+  const storageStatePath = join(tempDir, "mangabuff.json");
+  const requests: Array<string> = [];
+  let loginPostAttempts = 0;
+
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    const method = init?.method ?? "GET";
+    requests.push(`${method} ${url}`);
+
+    if (url === "https://mangabuff.ru/login" && method === "GET") {
+      return textResponseWithCookies(
+        '<html><head><meta name="csrf-token" content="csrf-from-page"></head></html>',
+        [
+          "XSRF-TOKEN=login-xsrf; Path=/; Expires=Wed, 21 Oct 2030 07:28:00 GMT",
+          "mangabuff_session=login-session; Path=/; HttpOnly; Expires=Wed, 21 Oct 2030 07:28:00 GMT",
+        ],
+      );
+    }
+
+    if (url === "https://mangabuff.ru/login" && method === "POST") {
+      loginPostAttempts += 1;
+
+      if (loginPostAttempts === 1) {
+        return new Response('{"message":"Page Expired"}', { status: 419 });
+      }
+
+      return textResponseWithCookies('{"ok":true}', [
+        "remember_web_test=remember-token; Path=/; HttpOnly; Expires=Wed, 21 Oct 2030 07:28:00 GMT",
+        "mangabuff_session=fresh-session; Path=/; HttpOnly; Expires=Wed, 21 Oct 2030 07:28:00 GMT",
+      ]);
+    }
+
+    if (url === "https://mangabuff.ru/trades") {
+      return textResponseWithCookies("<html><body>Предложения Отправленные</body></html>", [
+        "XSRF-TOKEN=fresh-xsrf; Path=/; Expires=Wed, 21 Oct 2030 07:28:00 GMT",
+      ]);
+    }
+
+    throw new Error(`Unexpected fetch: ${url}`);
+  }) as typeof fetch;
+
+  try {
+    const saved = await autoLoginMangabuffHttpSession({
+      login: "user@example.com",
+      maxAttempts: 2,
+      password: "secret-password",
+      retryDelayMs: 0,
+      storageStatePath,
+    });
+    const savedState = JSON.parse(await readFile(storageStatePath, "utf8"));
+
+    assert.equal(saved, true);
+    assert.equal(loginPostAttempts, 2);
+    assert.deepEqual(requests, [
+      "GET https://mangabuff.ru/login",
+      "POST https://mangabuff.ru/login",
+      "GET https://mangabuff.ru/login",
+      "POST https://mangabuff.ru/login",
+      "GET https://mangabuff.ru/trades",
+    ]);
+    assert.ok(savedState.cookies.some((cookie: { name: string }) => cookie.name === "remember_web_test"));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(tempDir, { force: true, recursive: true });
+  }
+});
+
 test("safe mode records an exchange that passes rules without accepting it", async () => {
   await withDatabase(async (db) => {
     const session = new FakeHttpSession();

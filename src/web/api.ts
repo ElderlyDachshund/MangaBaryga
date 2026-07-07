@@ -52,7 +52,12 @@ export interface ApiState {
     lastError?: string;
   };
   auth: {
+    authorized?: boolean;
+    lastAttemptAt?: string;
+    lastFailureReason?: string;
+    lastSuccessAt?: string;
     manualAuthActive: boolean;
+    recoveryScheduledAt?: string;
   };
   trades: TradeRecord[];
 }

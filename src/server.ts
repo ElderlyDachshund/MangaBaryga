@@ -30,6 +30,14 @@ interface RuntimeState {
   lastError?: string;
 }
 
+interface AuthRuntimeState {
+  authorized?: boolean;
+  lastAttemptAt?: string;
+  lastFailureReason?: string;
+  lastSuccessAt?: string;
+  recoveryScheduledAt?: string;
+}
+
 class HttpError extends Error {
   constructor(
     public readonly statusCode: number,
@@ -50,9 +58,11 @@ const runtime: RuntimeState = {
   running: false,
   stopping: false,
 };
+const authRuntime: AuthRuntimeState = {};
 let botAbortController: AbortController | undefined;
 let manualAuthSession: ManualAuthSession | undefined;
 let autoLoginRefreshRunning = false;
+let authRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
 
 export function startControlServer(port = readPort()): void {
   const hostname = readHostname();
@@ -165,6 +175,12 @@ function createControlApp(): Hono {
 
   app.get("/api/auth/status", async (context) => {
     const authorized = await checkSavedMangabuffHttpSession();
+
+    if (authorized) {
+      markAuthAuthorized("status_endpoint");
+    } else {
+      markAuthUnauthorized("status_endpoint_failed");
+    }
 
     return context.json({ authorized });
   });
@@ -337,6 +353,7 @@ function buildState(db: AppDatabase): object {
     settings: sanitizeSettings(loadRuntimeSettings(db)),
     runtime,
     auth: {
+      ...authRuntime,
       manualAuthActive: Boolean(manualAuthSession),
     },
     trades: listTrades(db, 50),
@@ -585,6 +602,7 @@ async function ensureSavedMangabuffSessionAuthorized(): Promise<boolean> {
   logInfo("Checking saved Mangabuff HTTP session");
 
   if (await checkSavedMangabuffHttpSession()) {
+    markAuthAuthorized("saved_session_check");
     return true;
   }
 
@@ -592,16 +610,27 @@ async function ensureSavedMangabuffSessionAuthorized(): Promise<boolean> {
 
   if (!credentials) {
     logWarn("Saved Mangabuff HTTP session is not authorized and auto-login credentials are missing");
+    markAuthUnauthorized("missing_credentials");
     return false;
   }
 
   logWarn("Saved Mangabuff HTTP session is not authorized; trying auto-login");
 
   if (!(await runMangabuffAutoLogin(credentials, "startup_auth_check"))) {
+    scheduleAuthRecovery("startup_auth_check_failed");
     return false;
   }
 
-  return checkSavedMangabuffHttpSession();
+  const authorized = await checkSavedMangabuffHttpSession();
+
+  if (authorized) {
+    markAuthAuthorized("post_autologin_check");
+    return true;
+  }
+
+  markAuthUnauthorized("post_autologin_check_failed");
+  scheduleAuthRecovery("post_autologin_check_failed");
+  return false;
 }
 
 function startAutoLoginRefreshLoop(): void {
@@ -650,9 +679,15 @@ async function runAutoLoginRefresh(credentials: MangabuffCredentials): Promise<v
 
     if (saved && shouldRestartBot) {
       await startBot(db);
+      return;
+    }
+
+    if (!saved) {
+      scheduleAuthRecovery("scheduled_refresh_failed");
     }
   } catch (error) {
     logError("Mangabuff auto-login refresh failed", { error: formatError(error) });
+    scheduleAuthRecovery("scheduled_refresh_failed");
   }
 }
 
@@ -668,6 +703,8 @@ async function restartBotAfterAuthRequired(db: AppDatabase): Promise<void> {
 
   if (!(await runMangabuffAutoLogin(credentials, "auth_required_restart"))) {
     runtime.lastError = "Автологин Mangabuff не подтвердил авторизацию.";
+    markAuthUnauthorized("auth_required_restart_failed");
+    scheduleAuthRecovery("auth_required_restart_failed");
     return;
   }
 
@@ -676,7 +713,7 @@ async function restartBotAfterAuthRequired(db: AppDatabase): Promise<void> {
 
 async function runMangabuffAutoLogin(
   credentials: MangabuffCredentials,
-  reason: "startup_auth_check" | "scheduled_refresh" | "auth_required_restart",
+  reason: "startup_auth_check" | "scheduled_refresh" | "auth_required_restart" | "background_recovery",
 ): Promise<boolean> {
   if (autoLoginRefreshRunning) {
     logInfo("Mangabuff auto-login skipped because another refresh is running", { reason });
@@ -686,6 +723,7 @@ async function runMangabuffAutoLogin(
   autoLoginRefreshRunning = true;
 
   try {
+    authRuntime.lastAttemptAt = new Date().toISOString();
     logInfo("Mangabuff auto-login started", { reason });
     const saved = await autoLoginMangabuffHttpSession(credentials);
     logInfo("Mangabuff auto-login finished", {
@@ -694,9 +732,16 @@ async function runMangabuffAutoLogin(
       time: new Date().toLocaleString("ru-RU"),
     });
 
+    if (saved) {
+      markAuthAuthorized("auto_login");
+    } else {
+      markAuthUnauthorized("auto_login_unconfirmed");
+    }
+
     return saved;
   } catch (error) {
     logError("Mangabuff auto-login failed", { error: formatError(error), reason });
+    markAuthUnauthorized(formatError(error));
     return false;
   } finally {
     autoLoginRefreshRunning = false;
@@ -716,6 +761,8 @@ function readMangabuffCredentials(): MangabuffCredentials | undefined {
 
 function logTradesPass(result: TradesPassResult): void {
   if (result.status === "auth_required") {
+    markAuthUnauthorized(result.reason);
+    scheduleAuthRecovery("bot_pass_auth_required");
     logWarn("Bot pass requires Mangabuff authorization", {
       passNumber: result.passNumber,
       reason: result.reason,
@@ -804,6 +851,127 @@ function readAutoLoginIntervalHours(): number | undefined {
   }
 
   return hours;
+}
+
+function readAuthRetryMinutes(): number {
+  const value = process.env.MANGABUFF_AUTH_RETRY_MINUTES?.trim();
+
+  if (!value) {
+    return 5;
+  }
+
+  const minutes = Number(value);
+
+  if (!Number.isFinite(minutes) || minutes < 1 || minutes > 60) {
+    throw new Error("MANGABUFF_AUTH_RETRY_MINUTES должен быть числом от 1 до 60.");
+  }
+
+  return minutes;
+}
+
+function scheduleAuthRecovery(reason: string): void {
+  if (authRecoveryTimer) {
+    logInfo("Mangabuff auth recovery is already scheduled", { reason });
+    return;
+  }
+
+  const retryMinutes = readAuthRetryMinutes();
+  const retryMs = retryMinutes * 60 * 1_000;
+  const scheduledAt = new Date(Date.now() + retryMs).toISOString();
+
+  authRuntime.recoveryScheduledAt = scheduledAt;
+  authRecoveryTimer = setTimeout(() => {
+    authRecoveryTimer = undefined;
+    authRuntime.recoveryScheduledAt = undefined;
+    void runAuthRecovery().catch((error) => {
+      logError("Mangabuff auth recovery crashed", { error: formatError(error) });
+      markAuthUnauthorized(formatError(error));
+      scheduleAuthRecovery("background_recovery_crashed");
+    });
+  }, retryMs);
+
+  logWarn("Mangabuff auth recovery scheduled", {
+    reason,
+    retryMinutes,
+    scheduledAt,
+  });
+}
+
+async function runAuthRecovery(): Promise<void> {
+  const credentials = readMangabuffCredentials();
+
+  if (!credentials) {
+    logWarn("Mangabuff auth recovery skipped because credentials are missing");
+    markAuthUnauthorized("missing_credentials");
+    return;
+  }
+
+  logInfo("Mangabuff auth recovery started", {
+    autoStartBot: process.env.AUTO_START_BOT === "true",
+    botRunning: runtime.running,
+  });
+
+  if (await checkSavedMangabuffHttpSession().catch(() => false)) {
+    markAuthAuthorized("background_saved_session_check");
+    await maybeRestartBotAfterAuthRecovery();
+    return;
+  }
+
+  const saved = await runMangabuffAutoLogin(credentials, "background_recovery");
+
+  if (!saved) {
+    scheduleAuthRecovery("background_recovery_failed");
+    return;
+  }
+
+  const authorized = await checkSavedMangabuffHttpSession().catch(() => false);
+
+  if (!authorized) {
+    markAuthUnauthorized("background_post_autologin_check_failed");
+    scheduleAuthRecovery("background_post_autologin_check_failed");
+    return;
+  }
+
+  markAuthAuthorized("background_post_autologin_check");
+  await maybeRestartBotAfterAuthRecovery();
+}
+
+async function maybeRestartBotAfterAuthRecovery(): Promise<void> {
+  if (process.env.AUTO_START_BOT !== "true" || runtime.running) {
+    return;
+  }
+
+  logInfo("Mangabuff auth recovery will restart the bot");
+
+  try {
+    await startBot(db);
+  } catch (error) {
+    logError("Mangabuff auth recovery could not restart the bot", { error: formatError(error) });
+    scheduleAuthRecovery("background_restart_failed");
+  }
+}
+
+function markAuthAuthorized(source: string): void {
+  if (authRecoveryTimer) {
+    clearTimeout(authRecoveryTimer);
+    authRecoveryTimer = undefined;
+  }
+
+  authRuntime.authorized = true;
+  authRuntime.lastFailureReason = undefined;
+  authRuntime.recoveryScheduledAt = undefined;
+  authRuntime.lastSuccessAt = new Date().toISOString();
+  runtime.lastError = runtime.lastError === "Ожидается повторная авторизация Mangabuff." ? undefined : runtime.lastError;
+  logInfo("Mangabuff authorization confirmed", { source });
+}
+
+function markAuthUnauthorized(reason: string): void {
+  authRuntime.authorized = false;
+  authRuntime.lastFailureReason = reason;
+
+  if (!runtime.running) {
+    runtime.lastError = "Ожидается повторная авторизация Mangabuff.";
+  }
 }
 
 async function waitForBotStopped(timeoutMs = 660_000): Promise<void> {

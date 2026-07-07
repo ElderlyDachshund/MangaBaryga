@@ -248,6 +248,7 @@ export function App() {
                 Проверить вход
               </Button>
             </div>
+            <p className="mt-3 text-sm text-stone-500">{formatAuthStatus(state?.auth)}</p>
             <InlineMessage message={authMessage} />
           </section>
         </aside>
@@ -599,6 +600,28 @@ function InlineMessage({ message }: { message: Message }) {
       : "mt-3 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800";
 
   return <div className={className}>{message.text}</div>;
+}
+
+function formatAuthStatus(auth: ApiState["auth"] | undefined): string {
+  if (!auth) {
+    return "Проверка авторизации ещё не выполнялась.";
+  }
+
+  if (auth.authorized) {
+    return auth.lastSuccessAt
+      ? `Mangabuff авторизован. Последний успех: ${formatDate(auth.lastSuccessAt)}.`
+      : "Mangabuff авторизован.";
+  }
+
+  if (auth.recoveryScheduledAt) {
+    return `Mangabuff ждёт повторную авторизацию. Следующая попытка: ${formatDate(auth.recoveryScheduledAt)}.`;
+  }
+
+  if (auth.lastFailureReason) {
+    return `Mangabuff требует повторной авторизации: ${auth.lastFailureReason}.`;
+  }
+
+  return "Mangabuff требует повторной авторизации.";
 }
 
 function createEmptySettingsForm(): SettingsForm {

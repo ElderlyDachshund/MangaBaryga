@@ -61,6 +61,8 @@ export interface MangabuffSessionClient {
 export interface MangabuffHttpAutoLoginOptions {
   login: string;
   password: string;
+  maxAttempts?: number;
+  retryDelayMs?: number;
   storageStatePath?: string;
 }
 
@@ -279,63 +281,135 @@ export async function openSavedMangabuffHttpSession(
 
 export async function autoLoginMangabuffHttpSession(options: MangabuffHttpAutoLoginOptions): Promise<boolean> {
   const storageStatePath = options.storageStatePath ?? mangabuffStorageStatePath;
-  const storageState: StorageState = {
-    cookies: [],
-    origins: [{ localStorage: [], origin: "https://mangabuff.ru" }],
-  };
-  const session = new MangabuffHttpSession(storageState.cookies, storageState, storageStatePath);
+  const maxAttempts = normalizeAutoLoginMaxAttempts(options.maxAttempts);
+  const retryDelayMs = normalizeAutoLoginRetryDelayMs(options.retryDelayMs);
 
   logInfo("Mangabuff HTTP auto-login started", {
+    maxAttempts,
     proxyConfigured: Boolean(readMangabuffProxyUrl()),
     storageStatePath,
   });
 
-  const loginPage = await session.getText(mangabuffLoginUrl);
-  const csrfToken = extractCsrfToken(loginPage.text);
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const storageState: StorageState = {
+      cookies: [],
+      origins: [{ localStorage: [], origin: "https://mangabuff.ru" }],
+    };
+    const session = new MangabuffHttpSession(storageState.cookies, storageState, storageStatePath);
 
-  if (!loginPage.ok || !csrfToken) {
-    logWarn("Mangabuff HTTP auto-login could not read login page", {
-      hasCsrfToken: Boolean(csrfToken),
-      status: loginPage.status,
-      url: loginPage.url,
-    });
-    return false;
+    try {
+      const loginPage = await session.getText(mangabuffLoginUrl);
+      const csrfToken = extractCsrfToken(loginPage.text);
+
+      if (!loginPage.ok || !csrfToken) {
+        logWarn("Mangabuff HTTP auto-login could not read login page", {
+          attempt,
+          hasCsrfToken: Boolean(csrfToken),
+          maxAttempts,
+          status: loginPage.status,
+          url: loginPage.url,
+        });
+
+        if (!(await shouldRetryAutoLoginAttempt({
+          attempt,
+          maxAttempts,
+          retryDelayMs,
+          retryable: isRetryableAutoLoginStatus(loginPage.status),
+          status: loginPage.status,
+          step: "login_page",
+        }))) {
+          return false;
+        }
+
+        continue;
+      }
+
+      const loginResponse = await session.postForm(
+        mangabuffLoginUrl,
+        {
+          email: options.login,
+          password: options.password,
+        },
+        {
+          csrfToken,
+          referer: mangabuffLoginUrl,
+        },
+      );
+
+      if (!loginResponse.ok) {
+        logWarn("Mangabuff HTTP auto-login POST failed", {
+          attempt,
+          maxAttempts,
+          status: loginResponse.status,
+          url: loginResponse.url,
+        });
+
+        if (!(await shouldRetryAutoLoginAttempt({
+          attempt,
+          maxAttempts,
+          retryDelayMs,
+          retryable: isRetryableAutoLoginStatus(loginResponse.status),
+          status: loginResponse.status,
+          step: "login_post",
+        }))) {
+          return false;
+        }
+
+        continue;
+      }
+
+      const tradesPage = await session.getText(mangabuffTradesUrl);
+
+      if (!isMangabuffAuthorizedHttpResponse(tradesPage)) {
+        logWarn("Mangabuff HTTP auto-login did not produce authorized session", {
+          attempt,
+          maxAttempts,
+          status: tradesPage.status,
+          url: tradesPage.url,
+        });
+
+        if (!(await shouldRetryAutoLoginAttempt({
+          attempt,
+          maxAttempts,
+          retryDelayMs,
+          retryable: isRetryableAutoLoginStatus(tradesPage.status),
+          status: tradesPage.status,
+          step: "trades_check",
+        }))) {
+          return false;
+        }
+
+        continue;
+      }
+
+      await session.saveStorageState();
+      logInfo("Mangabuff HTTP auto-login saved authorized session", {
+        attempt,
+        storageStatePath,
+      });
+
+      return true;
+    } catch (error) {
+      logWarn("Mangabuff HTTP auto-login attempt failed", {
+        attempt,
+        error: formatAutoLoginError(error),
+        maxAttempts,
+      });
+
+      if (!(await shouldRetryAutoLoginAttempt({
+        attempt,
+        error,
+        maxAttempts,
+        retryDelayMs,
+        retryable: isRetryableAutoLoginError(error),
+        step: "request_error",
+      }))) {
+        throw error;
+      }
+    }
   }
 
-  const loginResponse = await session.postForm(
-    mangabuffLoginUrl,
-    {
-      email: options.login,
-      password: options.password,
-    },
-    {
-      csrfToken,
-      referer: mangabuffLoginUrl,
-    },
-  );
-
-  if (!loginResponse.ok) {
-    logWarn("Mangabuff HTTP auto-login POST failed", {
-      status: loginResponse.status,
-      url: loginResponse.url,
-    });
-    return false;
-  }
-
-  const tradesPage = await session.getText(mangabuffTradesUrl);
-
-  if (!isMangabuffAuthorizedHttpResponse(tradesPage)) {
-    logWarn("Mangabuff HTTP auto-login did not produce authorized session", {
-      status: tradesPage.status,
-      url: tradesPage.url,
-    });
-    return false;
-  }
-
-  await session.saveStorageState();
-  logInfo("Mangabuff HTTP auto-login saved authorized session", { storageStatePath });
-
-  return true;
+  return false;
 }
 
 export async function checkSavedMangabuffHttpSession(
@@ -516,6 +590,88 @@ function normalizeSameSite(value: string): "Strict" | "Lax" | "None" | undefined
   }
 
   return undefined;
+}
+
+function normalizeAutoLoginMaxAttempts(value: number | undefined): number {
+  if (value === undefined) {
+    return 3;
+  }
+
+  if (!Number.isInteger(value) || value < 1 || value > 5) {
+    throw new Error("Mangabuff auto-login maxAttempts must be an integer between 1 and 5.");
+  }
+
+  return value;
+}
+
+function normalizeAutoLoginRetryDelayMs(value: number | undefined): number {
+  if (value === undefined) {
+    return 2_000;
+  }
+
+  if (!Number.isInteger(value) || value < 0 || value > 60_000) {
+    throw new Error("Mangabuff auto-login retryDelayMs must be an integer between 0 and 60000.");
+  }
+
+  return value;
+}
+
+function isRetryableAutoLoginStatus(status: number): boolean {
+  return status === 419 || status === 425 || status === 429 || status >= 500;
+}
+
+function isRetryableAutoLoginError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const message = error.message.toLowerCase();
+
+  return (
+    message.includes("aborted") ||
+    message.includes("timeout") ||
+    message.includes("socket") ||
+    message.includes("connect") ||
+    message.includes("econn") ||
+    message.includes("enotfound") ||
+    message.includes("etimedout")
+  );
+}
+
+async function shouldRetryAutoLoginAttempt(options: {
+  attempt: number;
+  error?: unknown;
+  maxAttempts: number;
+  retryDelayMs: number;
+  retryable: boolean;
+  status?: number;
+  step: "login_page" | "login_post" | "trades_check" | "request_error";
+}): Promise<boolean> {
+  if (!options.retryable || options.attempt >= options.maxAttempts) {
+    return false;
+  }
+
+  const waitMs = options.retryDelayMs * options.attempt;
+
+  logInfo("Mangabuff HTTP auto-login retry scheduled", {
+    attempt: options.attempt,
+    error: options.error ? formatAutoLoginError(options.error) : undefined,
+    maxAttempts: options.maxAttempts,
+    nextAttempt: options.attempt + 1,
+    status: options.status,
+    step: options.step,
+    waitMs,
+  });
+
+  if (waitMs > 0) {
+    await sleep(waitMs);
+  }
+
+  return true;
+}
+
+function formatAutoLoginError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function defaultCookiePath(pathname: string): string {
