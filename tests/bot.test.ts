@@ -156,6 +156,57 @@ test("HTTP session persists refreshed cookies back to saved storage state", asyn
   }
 });
 
+test("HTTP session reads every cookie from a combined set-cookie header", async () => {
+  const originalFetch = globalThis.fetch;
+  const requestCookies: string[] = [];
+  let requestCount = 0;
+
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    const headers = init?.headers as Record<string, string> | undefined;
+    requestCookies.push(headers?.cookie ?? "");
+    requestCount += 1;
+
+    if (requestCount === 1) {
+      return new Response("<html></html>", {
+        headers: {
+          "set-cookie":
+            "__ddg8_=guard-token; Domain=.mangabuff.ru; Path=/; Expires=Wed, 21 Oct 2030 07:28:00 GMT, " +
+            "__ddg10_=guard-ts; Domain=.mangabuff.ru; Path=/; Expires=Wed, 21 Oct 2030 07:28:00 GMT, " +
+            "XSRF-TOKEN=login-xsrf; Path=/; Expires=Wed, 21 Oct 2030 07:28:00 GMT, " +
+            "mangabuff_session=login-session; Path=/; HttpOnly; Expires=Wed, 21 Oct 2030 07:28:00 GMT",
+        },
+        status: 200,
+      });
+    }
+
+    return new Response('{"ok":true}', { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const session = new MangabuffHttpSession([]);
+
+    await session.getText("https://mangabuff.ru/login");
+    await session.postForm(
+      "https://mangabuff.ru/login",
+      {
+        email: "user@example.com",
+        password: "secret-password",
+      },
+      {
+        csrfToken: "csrf-from-page",
+        referer: "https://mangabuff.ru/login",
+      },
+    );
+
+    assert.match(requestCookies[1], /__ddg8_=guard-token/);
+    assert.match(requestCookies[1], /__ddg10_=guard-ts/);
+    assert.match(requestCookies[1], /XSRF-TOKEN=login-xsrf/);
+    assert.match(requestCookies[1], /mangabuff_session=login-session/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("HTTP auto-login posts credentials with page CSRF and saves verified cookies", async () => {
   const originalFetch = globalThis.fetch;
   const tempDir = await mkdtemp(join(tmpdir(), "mangabuff-auth-"));

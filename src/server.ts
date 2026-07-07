@@ -291,7 +291,11 @@ async function startManualAuth(): Promise<void> {
     manualAuthSession = undefined;
   }
 
-  manualAuthSession = await startMangabuffManualAuth();
+  try {
+    manualAuthSession = await startMangabuffManualAuth();
+  } catch (error) {
+    throw mapManualAuthStartError(error);
+  }
 }
 
 async function completeManualAuth(): Promise<boolean> {
@@ -325,6 +329,19 @@ async function cancelManualAuth(): Promise<void> {
 
   await cancelMangabuffManualAuth(manualAuthSession);
   manualAuthSession = undefined;
+}
+
+function mapManualAuthStartError(error: unknown): Error {
+  const message = formatError(error);
+
+  if (message.includes("browserType.launch: Executable doesn't exist")) {
+    return new HttpError(
+      500,
+      "Ручная авторизация недоступна: в окружении не установлен Chromium для Playwright. Пересобери Docker-образ с INSTALL_PLAYWRIGHT=true или загрузи готовую сессию в MANGABUFF_STORAGE_STATE_PATH.",
+    );
+  }
+
+  return error instanceof Error ? error : new Error(message);
 }
 
 async function focusManualAuth(authSession: ManualAuthSession): Promise<boolean> {

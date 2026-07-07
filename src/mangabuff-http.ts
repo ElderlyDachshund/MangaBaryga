@@ -475,7 +475,7 @@ function readSetCookieHeaders(headers: Headers): string[] {
   const getSetCookie = (headers as Headers & { getSetCookie?: () => string[] }).getSetCookie;
 
   if (typeof getSetCookie === "function") {
-    return getSetCookie.call(headers);
+    return getSetCookie.call(headers).flatMap((header) => splitCombinedSetCookieHeader(header));
   }
 
   const setCookie = headers.get("set-cookie");
@@ -490,29 +490,20 @@ function readSetCookieHeaders(headers: Headers): string[] {
 function splitCombinedSetCookieHeader(header: string): string[] {
   const cookies: string[] = [];
   let start = 0;
-  let inExpires = false;
 
   for (let index = 0; index < header.length; index += 1) {
-    const char = header[index];
-
-    if (char === ",") {
-      if (!inExpires) {
-        cookies.push(header.slice(start, index).trim());
-        start = index + 1;
-      }
-
+    if (header[index] !== ",") {
       continue;
     }
 
-    if (char === ";") {
-      inExpires = false;
+    const rest = header.slice(index + 1);
+
+    if (!/^\s*[!#$%&'*+\-.^_`|~0-9A-Za-z]+=/.test(rest)) {
       continue;
     }
 
-    if (header.slice(index, index + 8).toLowerCase() === "expires=") {
-      inExpires = true;
-      index += 7;
-    }
+    cookies.push(header.slice(start, index).trim());
+    start = index + 1;
   }
 
   cookies.push(header.slice(start).trim());
