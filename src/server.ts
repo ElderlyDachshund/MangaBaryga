@@ -13,7 +13,14 @@ import {
   startMangabuffManualAuth,
   type ManualAuthSession,
 } from "./browser.js";
-import { listTrades, loadSettings, openDatabase, saveSettingsPatch, type AppDatabase } from "./db.js";
+import {
+  listTrades,
+  loadSettings,
+  openDatabase,
+  runDatabaseMaintenance,
+  saveSettingsPatch,
+  type AppDatabase,
+} from "./db.js";
 import type { BotSettings } from "./domain.js";
 import { formatError, logError, logInfo, logWarn } from "./logger.js";
 import { autoLoginMangabuffHttpSession, checkSavedMangabuffHttpSession } from "./mangabuff-http.js";
@@ -69,6 +76,7 @@ export function startControlServer(port = readPort()): void {
   const app = createControlApp();
 
   void logStartupDiagnostics(hostname, port);
+  performDatabaseMaintenance("startup");
 
   serve(
     {
@@ -243,6 +251,10 @@ async function startBot(db: AppDatabase): Promise<void> {
     onPass: (result) => {
       runtime.lastPass = result;
       logTradesPass(result);
+
+      if (result.passNumber % 25 === 0) {
+        performDatabaseMaintenance(`pass_${result.passNumber}`);
+      }
     },
   })
     .catch((error) => {
@@ -815,6 +827,25 @@ function logTradesPass(result: TradesPassResult): void {
     visibleCount: result.visibleTrades.length,
     visibleTradePageCount: result.visibleTradePageCount,
     visibleTradeIds: result.visibleTrades.map((trade) => trade.tradeId).join(","),
+  });
+}
+
+function performDatabaseMaintenance(reason: string): void {
+  const result = runDatabaseMaintenance(db);
+
+  if (result.deletedTrades > 0) {
+    logInfo("Database maintenance deleted old trades", {
+      deletedTrades: result.deletedTrades,
+      reason,
+      retentionDays: result.retentionDays,
+    });
+    return;
+  }
+
+  logInfo("Database maintenance finished", {
+    checkpointMode: result.checkpointMode,
+    reason,
+    retentionDays: result.retentionDays,
   });
 }
 

@@ -57,12 +57,16 @@ interface SettingRow {
 
 export type AppDatabase = Database.Database;
 
+const defaultTradeRetentionDays = 30;
+
 export function openDatabase(
   path = process.env.DATABASE_PATH ?? process.env.DB_PATH ?? "data/baryga-manga.sqlite",
 ): AppDatabase {
   mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path);
   db.pragma("journal_mode = WAL");
+  db.pragma("busy_timeout = 5000");
+  db.pragma("journal_size_limit = 5242880");
   db.exec(schemaSql);
   migrateDatabase(db);
   return db;
@@ -285,6 +289,31 @@ export function findTradeById(db: AppDatabase, tradeId: string): TradeRecord | u
   return mapTradeRow(row);
 }
 
+export function runDatabaseMaintenance(
+  db: AppDatabase,
+  options: { retentionDays?: number } = {},
+): { checkpointMode: string; deletedTrades: number; retentionDays: number } {
+  const retentionDays = normalizeTradeRetentionDays(options.retentionDays);
+  const deletedTrades =
+    retentionDays > 0
+      ? db
+          .prepare(
+            `DELETE FROM trades
+             WHERE updated_at < datetime('now', ?)`,
+          )
+          .run(`-${retentionDays} days`).changes
+      : 0;
+
+  // Truncate the WAL file so SQLite does not keep growing temporary disk usage.
+  db.pragma("wal_checkpoint(TRUNCATE)");
+
+  return {
+    checkpointMode: "TRUNCATE",
+    deletedTrades,
+    retentionDays,
+  };
+}
+
 function mapTradeRow(row: TradeRow): TradeRecord {
   return {
     tradeId: row.trade_id,
@@ -394,4 +423,25 @@ function backfillRankRuleResults(db: AppDatabase): void {
      WHERE rank_rule_result = 'не_проверялось'
        AND reason LIKE 'Ранговое правило не выполнено:%'`,
   ).run();
+}
+
+function normalizeTradeRetentionDays(value: number | undefined): number {
+  const source = value ?? readTradeRetentionDaysFromEnv();
+
+  if (source === undefined || !Number.isFinite(source) || source <= 0) {
+    return defaultTradeRetentionDays;
+  }
+
+  return Math.max(1, Math.min(Math.trunc(source), 365));
+}
+
+function readTradeRetentionDaysFromEnv(): number | undefined {
+  const value = process.env.TRADE_RETENTION_DAYS?.trim();
+
+  if (!value) {
+    return undefined;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
