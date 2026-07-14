@@ -41,6 +41,20 @@ test("readBrowserProxySettings prefers the proxy override", () => {
   }
 });
 
+test("readBrowserProxySettings can disable a stale proxy with the direct override", () => {
+  const originalProxyUrl = process.env.MANGABUFF_PROXY_URL;
+  const originalProxyOverrideUrl = process.env.MANGABUFF_PROXY_OVERRIDE_URL;
+  process.env.MANGABUFF_PROXY_URL = "http://stale-proxy.example:8000";
+  process.env.MANGABUFF_PROXY_OVERRIDE_URL = "direct";
+
+  try {
+    assert.equal(readBrowserProxySettings(), undefined);
+  } finally {
+    restoreEnv("MANGABUFF_PROXY_URL", originalProxyUrl);
+    restoreEnv("MANGABUFF_PROXY_OVERRIDE_URL", originalProxyOverrideUrl);
+  }
+});
+
 test("proxyAwareFetch sends requests through SOCKS5 proxies", async () => {
   const originalProxyUrl = process.env.MANGABUFF_PROXY_URL;
   const targetRequests: Array<{ host: string | undefined; url: string | undefined }> = [];
