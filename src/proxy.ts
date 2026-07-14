@@ -15,7 +15,9 @@ export interface BrowserProxySettings {
 }
 
 export function readMangabuffProxyUrl(): string | undefined {
-  const value = process.env.MANGABUFF_PROXY_URL?.trim();
+  const value =
+    process.env.MANGABUFF_PROXY_OVERRIDE_URL?.trim() ||
+    process.env.MANGABUFF_PROXY_URL?.trim();
   return value ? value : undefined;
 }
 

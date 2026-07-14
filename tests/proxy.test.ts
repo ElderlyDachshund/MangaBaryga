@@ -7,7 +7,9 @@ import { proxyAwareFetch, readBrowserProxySettings } from "../src/proxy.js";
 
 test("readBrowserProxySettings keeps SOCKS5 credentials for Playwright", () => {
   const originalProxyUrl = process.env.MANGABUFF_PROXY_URL;
+  const originalProxyOverrideUrl = process.env.MANGABUFF_PROXY_OVERRIDE_URL;
   process.env.MANGABUFF_PROXY_URL = "socks5://user-name:secret-pass@127.0.0.1:1080";
+  delete process.env.MANGABUFF_PROXY_OVERRIDE_URL;
 
   try {
     assert.deepEqual(readBrowserProxySettings(), {
@@ -17,6 +19,25 @@ test("readBrowserProxySettings keeps SOCKS5 credentials for Playwright", () => {
     });
   } finally {
     restoreEnv("MANGABUFF_PROXY_URL", originalProxyUrl);
+    restoreEnv("MANGABUFF_PROXY_OVERRIDE_URL", originalProxyOverrideUrl);
+  }
+});
+
+test("readBrowserProxySettings prefers the proxy override", () => {
+  const originalProxyUrl = process.env.MANGABUFF_PROXY_URL;
+  const originalProxyOverrideUrl = process.env.MANGABUFF_PROXY_OVERRIDE_URL;
+  process.env.MANGABUFF_PROXY_URL = "http://stale-proxy.example:8000";
+  process.env.MANGABUFF_PROXY_OVERRIDE_URL = "socks5://new-user:new-pass@127.0.0.1:1081";
+
+  try {
+    assert.deepEqual(readBrowserProxySettings(), {
+      password: "new-pass",
+      server: "socks5://127.0.0.1:1081",
+      username: "new-user",
+    });
+  } finally {
+    restoreEnv("MANGABUFF_PROXY_URL", originalProxyUrl);
+    restoreEnv("MANGABUFF_PROXY_OVERRIDE_URL", originalProxyOverrideUrl);
   }
 });
 
