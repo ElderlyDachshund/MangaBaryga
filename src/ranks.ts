@@ -177,7 +177,7 @@ function isLightDisputedDVariant(features: RankColorFeatures): boolean {
   return (
     isInRange(features.hue, 0.58, 0.59) &&
     isInRange(features.saturation, 0.22, 0.26) &&
-    isInRange(features.lightness, 0.757, 0.764) &&
+    isInRange(features.lightness, 0.757, 0.766) &&
     isInRange(features.coloredPixelRatio, 0.025, 0.032)
   );
 }

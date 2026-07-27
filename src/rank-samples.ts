@@ -34,6 +34,7 @@ export const rankSamples: RankSample[] = [
   { expectedRank: "D", cardId: "3618", cardUrl: "https://mangabuff.ru/cards/3618/users" },
   { expectedRank: "D", cardId: "5205", cardUrl: "https://mangabuff.ru/cards/5205/users" },
   { expectedRank: "D", cardId: "374203", cardUrl: "https://mangabuff.ru/cards/374203/users" },
+  { expectedRank: "D", cardId: "257838", cardUrl: "https://mangabuff.ru/cards/257838/users" },
   { expectedRank: "C", cardId: "576", cardUrl: "https://mangabuff.ru/cards/576/users" },
   { expectedRank: "C", cardId: "375433", cardUrl: "https://mangabuff.ru/cards/375433/users" },
   { expectedRank: "C", cardId: "372939", cardUrl: "https://mangabuff.ru/cards/372939/users" },

@@ -68,6 +68,21 @@ test("classifyRankByColorFeatures recognizes the bright standard D frame from th
   assert.equal(rank, "D");
 });
 
+test("classifyRankByColorFeatures recognizes the light D frame from trade 85327157", () => {
+  const rank = classifyRankByColorFeatures({
+    hue: 0.5877819259164636,
+    saturation: 0.23830742699687368,
+    lightness: 0.764888280893753,
+    coloredPixelRatio: 0.02670807453416149,
+    brightHue: 0.5694444444444445,
+    brightSaturation: 0.15789473684210542,
+    brightLightness: 0.8509803921568627,
+    brightPixelRatio: 0.0006211180124223603,
+  });
+
+  assert.equal(rank, "D");
+});
+
 test("recognizeCardRankFromImageBytes recognizes the bright standard D spectrum", async () => {
   const image = await createBrightDImage();
   const result = await recognizeCardRankFromImageBytes(image);
