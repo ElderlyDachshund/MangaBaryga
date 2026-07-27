@@ -139,7 +139,10 @@ export function classifyRankByColorFeatures(features: RankColorFeatures): CardRa
     return "C";
   }
 
-  if (isInRange(hue, 0.925, 0.975) && saturation >= 0.55 && coloredPixelRatio >= 0.6) {
+  if (
+    (isInRange(hue, 0.925, 0.975) && saturation >= 0.55 && coloredPixelRatio >= 0.6) ||
+    isMutedSVariant(features)
+  ) {
     return "S";
   }
 
@@ -170,6 +173,15 @@ function isLightDisputedDVariant(features: RankColorFeatures): boolean {
     isInRange(features.saturation, 0.22, 0.26) &&
     isInRange(features.lightness, 0.757, 0.764) &&
     isInRange(features.coloredPixelRatio, 0.025, 0.032)
+  );
+}
+
+function isMutedSVariant(features: RankColorFeatures): boolean {
+  return (
+    isInRange(features.hue, 0.94, 0.95) &&
+    isInRange(features.saturation, 0.5, 0.54) &&
+    isInRange(features.lightness, 0.45, 0.5) &&
+    isInRange(features.coloredPixelRatio, 0.68, 0.75)
   );
 }
 

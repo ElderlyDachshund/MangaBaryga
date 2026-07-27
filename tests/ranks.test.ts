@@ -53,6 +53,69 @@ test("classifyRankByColorFeatures recognizes the lighter D variant for rejected 
   }
 });
 
+test("classifyRankByColorFeatures recognizes the muted S variant from real cards", () => {
+  const samples = [
+    {
+      hue: 0.9443843853642545,
+      saturation: 0.5230041361622985,
+      lightness: 0.4723665814151744,
+      coloredPixelRatio: 0.7142857142857143,
+    },
+    {
+      hue: 0.9447701665267783,
+      saturation: 0.5211420941511623,
+      lightness: 0.47840612639905694,
+      coloredPixelRatio: 0.7236024844720497,
+    },
+    {
+      hue: 0.9444573968567684,
+      saturation: 0.5228549082847787,
+      lightness: 0.4725916453537934,
+      coloredPixelRatio: 0.7142857142857143,
+    },
+    {
+      hue: 0.9448189940320528,
+      saturation: 0.521395860225673,
+      lightness: 0.4784750950122753,
+      coloredPixelRatio: 0.724223602484472,
+    },
+    {
+      hue: 0.9444899277145762,
+      saturation: 0.523244907464747,
+      lightness: 0.4725780303418144,
+      coloredPixelRatio: 0.7136645962732919,
+    },
+    {
+      hue: 0.9447320608513873,
+      saturation: 0.5210954162197905,
+      lightness: 0.47714834859137056,
+      coloredPixelRatio: 0.7223602484472049,
+    },
+    {
+      hue: 0.9444365263442699,
+      saturation: 0.5227020246702481,
+      lightness: 0.4728780903665812,
+      coloredPixelRatio: 0.7142857142857143,
+    },
+    {
+      hue: 0.9444560400960861,
+      saturation: 0.5228497533786449,
+      lightness: 0.47259505541346947,
+      coloredPixelRatio: 0.7142857142857143,
+    },
+    {
+      hue: 0.9445033917227363,
+      saturation: 0.5228806690228947,
+      lightness: 0.4728917306052851,
+      coloredPixelRatio: 0.7142857142857143,
+    },
+  ];
+
+  for (const sample of samples) {
+    assert.equal(classifyRankByColorFeatures(sample), "S");
+  }
+});
+
 test("recognizeCardRankFromImageBytes keeps the lighter D regression for trade 131079 image", async () => {
   const image = await loadRankFixture("131079.png");
   const result = await recognizeCardRankFromImageBytes(image);
