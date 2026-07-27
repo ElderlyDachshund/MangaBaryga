@@ -11,6 +11,10 @@ export interface RankColorFeatures {
   saturation: number;
   lightness: number;
   coloredPixelRatio: number;
+  brightHue?: number;
+  brightSaturation?: number;
+  brightLightness?: number;
+  brightPixelRatio?: number;
 }
 
 export interface RankRecognitionResult {
@@ -106,8 +110,9 @@ export async function recognizeCardRankFromImageBytes(bytes: Uint8Array): Promis
 
 export function classifyRankByColorFeatures(features: RankColorFeatures): CardRank {
   const { hue, saturation, lightness, coloredPixelRatio } = features;
+  const isBrightStandardD = isBrightStandardDVariant(features);
 
-  if (coloredPixelRatio < 0.01) {
+  if (coloredPixelRatio < 0.01 && !isBrightStandardD) {
     return "unknown";
   }
 
@@ -126,7 +131,8 @@ export function classifyRankByColorFeatures(features: RankColorFeatures): CardRa
 
   if (
     (isInRange(hue, 0.54, 0.58) && isInRange(lightness, 0.24, 0.36) && coloredPixelRatio >= 0.5) ||
-    isLightDisputedDVariant(features)
+    isLightDisputedDVariant(features) ||
+    isBrightStandardD
   ) {
     return "D";
   }
@@ -176,6 +182,15 @@ function isLightDisputedDVariant(features: RankColorFeatures): boolean {
   );
 }
 
+function isBrightStandardDVariant(features: RankColorFeatures): boolean {
+  return (
+    isInRange(features.brightHue ?? 0, 0.56, 0.6) &&
+    isInRange(features.brightSaturation ?? 0, 0.2, 0.32) &&
+    isInRange(features.brightLightness ?? 0, 0.88, 0.95) &&
+    isInRange(features.brightPixelRatio ?? 0, 0.22, 0.36)
+  );
+}
+
 function isMutedSVariant(features: RankColorFeatures): boolean {
   return (
     isInRange(features.hue, 0.94, 0.95) &&
@@ -197,6 +212,11 @@ function extractRankColorFeaturesFromRgba(
   let saturationSum = 0;
   let lightnessSum = 0;
   let coloredPixelCount = 0;
+  let brightHueX = 0;
+  let brightHueY = 0;
+  let brightSaturationSum = 0;
+  let brightLightnessSum = 0;
+  let brightPixelCount = 0;
   const totalPixelCount = cropWidth * cropHeight;
 
   for (let y = 0; y < cropHeight; y += 1) {
@@ -230,6 +250,15 @@ function extractRankColorFeaturesFromRgba(
         hue /= 6;
       }
 
+      if (saturation > 0.15 && lightness > 0.85) {
+        const angle = hue * 2 * Math.PI;
+        brightHueX += Math.cos(angle);
+        brightHueY += Math.sin(angle);
+        brightSaturationSum += saturation;
+        brightLightnessSum += lightness;
+        brightPixelCount += 1;
+      }
+
       if (saturation <= 0.2 || lightness <= 0.08 || lightness >= 0.85) {
         continue;
       }
@@ -249,6 +278,7 @@ function extractRankColorFeaturesFromRgba(
       saturation: 0,
       lightness: 0,
       coloredPixelRatio: 0,
+      ...brightFeatures(),
     };
   }
 
@@ -259,7 +289,29 @@ function extractRankColorFeaturesFromRgba(
     saturation: saturationSum / coloredPixelCount,
     lightness: lightnessSum / coloredPixelCount,
     coloredPixelRatio: coloredPixelCount / totalPixelCount,
+    ...brightFeatures(),
   };
+
+  function brightFeatures(): Pick<
+    RankColorFeatures,
+    "brightHue" | "brightSaturation" | "brightLightness" | "brightPixelRatio"
+  > {
+    if (brightPixelCount === 0) {
+      return {
+        brightHue: 0,
+        brightSaturation: 0,
+        brightLightness: 0,
+        brightPixelRatio: 0,
+      };
+    }
+
+    return {
+      brightHue: (Math.atan2(brightHueY, brightHueX) / (2 * Math.PI) + 1) % 1,
+      brightSaturation: brightSaturationSum / brightPixelCount,
+      brightLightness: brightLightnessSum / brightPixelCount,
+      brightPixelRatio: brightPixelCount / totalPixelCount,
+    };
+  }
 }
 
 async function extractRankColorFeatures(page: Page, imageUrl: string): Promise<RankColorFeatures> {
@@ -293,6 +345,11 @@ async function extractRankColorFeatures(page: Page, imageUrl: string): Promise<R
     let saturationSum = 0;
     let lightnessSum = 0;
     let coloredPixelCount = 0;
+    let brightHueX = 0;
+    let brightHueY = 0;
+    let brightSaturationSum = 0;
+    let brightLightnessSum = 0;
+    let brightPixelCount = 0;
     const totalPixelCount = cropWidth * cropHeight;
 
     for (let index = 0; index < imageData.length; index += 4) {
@@ -324,6 +381,15 @@ async function extractRankColorFeatures(page: Page, imageUrl: string): Promise<R
         hue /= 6;
       }
 
+      if (saturation > 0.15 && lightness > 0.85) {
+        const angle = hue * 2 * Math.PI;
+        brightHueX += Math.cos(angle);
+        brightHueY += Math.sin(angle);
+        brightSaturationSum += saturation;
+        brightLightnessSum += lightness;
+        brightPixelCount += 1;
+      }
+
       if (saturation <= 0.2 || lightness <= 0.08 || lightness >= 0.85) {
         continue;
       }
@@ -342,6 +408,7 @@ async function extractRankColorFeatures(page: Page, imageUrl: string): Promise<R
         saturation: 0,
         lightness: 0,
         coloredPixelRatio: 0,
+        ...brightFeatures(),
       };
     }
 
@@ -352,7 +419,26 @@ async function extractRankColorFeatures(page: Page, imageUrl: string): Promise<R
       saturation: saturationSum / coloredPixelCount,
       lightness: lightnessSum / coloredPixelCount,
       coloredPixelRatio: coloredPixelCount / totalPixelCount,
+      ...brightFeatures(),
     };
+
+    function brightFeatures() {
+      if (brightPixelCount === 0) {
+        return {
+          brightHue: 0,
+          brightSaturation: 0,
+          brightLightness: 0,
+          brightPixelRatio: 0,
+        };
+      }
+
+      return {
+        brightHue: (Math.atan2(brightHueY, brightHueX) / (2 * Math.PI) + 1) % 1,
+        brightSaturation: brightSaturationSum / brightPixelCount,
+        brightLightness: brightLightnessSum / brightPixelCount,
+        brightPixelRatio: brightPixelCount / totalPixelCount,
+      };
+    }
   }, imageUrl);
 }
 

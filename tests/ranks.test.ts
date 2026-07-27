@@ -53,6 +53,33 @@ test("classifyRankByColorFeatures recognizes the lighter D variant for rejected 
   }
 });
 
+test("classifyRankByColorFeatures recognizes the bright standard D frame from the supplied screenshot", () => {
+  const rank = classifyRankByColorFeatures({
+    hue: 0,
+    saturation: 0,
+    lightness: 0,
+    coloredPixelRatio: 0,
+    brightHue: 0.5826217699657679,
+    brightSaturation: 0.2430147124917121,
+    brightLightness: 0.9148993229578842,
+    brightPixelRatio: 0.27701863354037265,
+  });
+
+  assert.equal(rank, "D");
+});
+
+test("recognizeCardRankFromImageBytes recognizes the bright standard D spectrum", async () => {
+  const image = await createBrightDImage();
+  const result = await recognizeCardRankFromImageBytes(image);
+
+  assert.equal(result.rank, "D");
+  assert.ok(result.features.brightHue && result.features.brightHue >= 0.56);
+  assert.ok(result.features.brightHue && result.features.brightHue <= 0.6);
+  assert.ok(result.features.brightSaturation && result.features.brightSaturation >= 0.2);
+  assert.ok(result.features.brightLightness && result.features.brightLightness >= 0.88);
+  assert.ok(result.features.brightPixelRatio && result.features.brightPixelRatio >= 0.22);
+});
+
 test("classifyRankByColorFeatures recognizes the muted S variant from real cards", () => {
   const samples = [
     {
@@ -156,6 +183,32 @@ async function createRankImage(hue: number, saturation: number, lightness: numbe
       height: 100,
       width: 100,
     },
+  })
+    .png()
+    .toBuffer();
+
+  return new Uint8Array(buffer);
+}
+
+async function createBrightDImage(): Promise<Uint8Array> {
+  const width = 100;
+  const height = 100;
+  const [red, green, blue] = hslToRgb(0.583, 0.24, 0.915);
+  const data = Buffer.alloc(width * height * 4, 255);
+
+  // The recognizer samples a 16 × 12 top-left area. 48 of its 192 pixels are
+  // bright blue-grey, matching the 25% bright-frame coverage of this D variant.
+  for (let y = 0; y < 3; y += 1) {
+    for (let x = 0; x < 16; x += 1) {
+      const offset = (y * width + x) * 4;
+      data[offset] = red;
+      data[offset + 1] = green;
+      data[offset + 2] = blue;
+    }
+  }
+
+  const buffer = await sharp(data, {
+    raw: { channels: 4, height, width },
   })
     .png()
     .toBuffer();
