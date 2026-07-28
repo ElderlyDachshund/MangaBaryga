@@ -67,6 +67,9 @@ export interface BotSettings {
   safeMode: boolean;
   autoAcceptEnabled: boolean;
   maxWantedPagesExclusive: number;
+  lockAllWantedPagesThreshold: number;
+  lockRecentWantedPagesThreshold: number;
+  lockRecentCardsLimit: number;
   loopPauseMs: number;
   browserMode: "headless" | "headful";
   rankRecognitionVerified: boolean;
@@ -77,6 +80,9 @@ export function createDefaultSettings(): BotSettings {
     safeMode: true,
     autoAcceptEnabled: false,
     maxWantedPagesExclusive: 5,
+    lockAllWantedPagesThreshold: 5,
+    lockRecentWantedPagesThreshold: 5,
+    lockRecentCardsLimit: 100,
     loopPauseMs: 5_000,
     browserMode: "headless",
     rankRecognitionVerified: false,

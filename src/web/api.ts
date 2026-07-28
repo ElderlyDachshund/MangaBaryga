@@ -36,6 +36,9 @@ export interface ApiSettings {
   autoAcceptEnabled: boolean;
   autoAcceptLocked: boolean;
   maxWantedPagesExclusive: number;
+  lockAllWantedPagesThreshold: number;
+  lockRecentWantedPagesThreshold: number;
+  lockRecentCardsLimit: number;
   loopPauseMs: number;
   browserMode: BotSettings["browserMode"];
   rankRecognitionVerified: boolean;
@@ -49,6 +52,30 @@ export interface ApiState {
     startedAt?: string;
     stoppedAt?: string;
     lastPass?: ApiRuntimePass;
+    lastError?: string;
+  };
+  cardLocking: {
+    status: "idle" | "running" | "stopping" | "completed" | "cancelled" | "error";
+    mode?: "all" | "recent";
+    threshold?: number;
+    requestedLimit?: number;
+    totalCount?: number;
+    checkedCount: number;
+    lockedCount: number;
+    alreadyLockedCount: number;
+    belowThresholdCount: number;
+    errorCount: number;
+    pagesProcessed: number;
+    currentPage?: number;
+    currentCardId?: string;
+    errors: Array<{
+      cardId?: string;
+      instanceId?: string;
+      page?: number;
+      reason: string;
+    }>;
+    startedAt?: string;
+    finishedAt?: string;
     lastError?: string;
   };
   auth: {
@@ -66,6 +93,9 @@ export interface SettingsPatch {
   telegramBotToken?: string;
   telegramChatId?: string;
   maxWantedPagesExclusive?: number;
+  lockAllWantedPagesThreshold?: number;
+  lockRecentWantedPagesThreshold?: number;
+  lockRecentCardsLimit?: number;
   loopPauseMs?: number;
   browserMode?: BotSettings["browserMode"];
   safeMode?: boolean;
@@ -89,6 +119,21 @@ export async function startBot(): Promise<ApiState> {
 
 export async function stopBot(): Promise<ApiState> {
   return request<ApiState>("/api/bot/stop", { method: "POST" });
+}
+
+export async function startCardLocking(options: {
+  mode: "all" | "recent";
+  threshold: number;
+  recentLimit?: number;
+}): Promise<ApiState> {
+  return request<ApiState>("/api/card-locking/start", {
+    body: JSON.stringify(options),
+    method: "POST",
+  });
+}
+
+export async function stopCardLocking(): Promise<ApiState> {
+  return request<ApiState>("/api/card-locking/stop", { method: "POST" });
 }
 
 export async function startAuth(): Promise<{ active: boolean }> {

@@ -14,6 +14,13 @@ import {
   type ManualAuthSession,
 } from "./browser.js";
 import {
+  runCardLockingInHttpSession,
+  saveCardLockingSession,
+  type CardLockingError,
+  type CardLockingMode,
+  type CardLockingProgress,
+} from "./card-locking.js";
+import {
   listTrades,
   loadSettings,
   openDatabase,
@@ -23,7 +30,11 @@ import {
 } from "./db.js";
 import type { BotSettings } from "./domain.js";
 import { formatError, logError, logInfo, logWarn } from "./logger.js";
-import { autoLoginMangabuffHttpSession, checkSavedMangabuffHttpSession } from "./mangabuff-http.js";
+import {
+  autoLoginMangabuffHttpSession,
+  checkSavedMangabuffHttpSession,
+  openSavedMangabuffHttpSession,
+} from "./mangabuff-http.js";
 import { readMangabuffProxyUrl } from "./proxy.js";
 import { runVisibleTradesLoop, type TradesPassResult } from "./trades.js";
 import { assertTelegramConfigured } from "./telegram.js";
@@ -43,6 +54,34 @@ interface AuthRuntimeState {
   lastFailureReason?: string;
   lastSuccessAt?: string;
   recoveryScheduledAt?: string;
+}
+
+type CardLockingRuntimeStatus =
+  | "idle"
+  | "running"
+  | "stopping"
+  | "completed"
+  | "cancelled"
+  | "error";
+
+interface CardLockingRuntimeState {
+  status: CardLockingRuntimeStatus;
+  mode?: CardLockingMode;
+  threshold?: number;
+  requestedLimit?: number;
+  totalCount?: number;
+  checkedCount: number;
+  lockedCount: number;
+  alreadyLockedCount: number;
+  belowThresholdCount: number;
+  errorCount: number;
+  pagesProcessed: number;
+  currentPage?: number;
+  currentCardId?: string;
+  errors: CardLockingError[];
+  startedAt?: string;
+  finishedAt?: string;
+  lastError?: string;
 }
 
 class HttpError extends Error {
@@ -66,7 +105,9 @@ const runtime: RuntimeState = {
   stopping: false,
 };
 const authRuntime: AuthRuntimeState = {};
+const cardLockingRuntime: CardLockingRuntimeState = createEmptyCardLockingRuntime();
 let botAbortController: AbortController | undefined;
+let cardLockingAbortController: AbortController | undefined;
 let manualAuthSession: ManualAuthSession | undefined;
 let autoLoginRefreshRunning = false;
 let authRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -159,6 +200,19 @@ function createControlApp(): Hono {
 
   app.post("/api/bot/stop", (context) => {
     stopBot();
+
+    return context.json(buildState(db));
+  });
+
+  app.post("/api/card-locking/start", async (context) => {
+    const body = await readJsonBody(context.req.raw);
+    await startCardLocking(db, body);
+
+    return context.json(buildState(db));
+  });
+
+  app.post("/api/card-locking/stop", (context) => {
+    stopCardLocking();
 
     return context.json(buildState(db));
   });
@@ -293,6 +347,122 @@ function stopBot(): void {
   botAbortController.abort();
 }
 
+async function startCardLocking(db: AppDatabase, body: unknown): Promise<void> {
+  if (cardLockingAbortController) {
+    throw new HttpError(409, "Проверка карт уже выполняется.");
+  }
+
+  const request = parseCardLockingStartRequest(body);
+  const settingsPatch: Partial<BotSettings> =
+    request.mode === "all"
+      ? { lockAllWantedPagesThreshold: request.threshold }
+      : {
+          lockRecentWantedPagesThreshold: request.threshold,
+          lockRecentCardsLimit: request.recentLimit,
+        };
+
+  saveSettingsPatch(db, settingsPatch);
+
+  const authorized = await ensureSavedMangabuffSessionAuthorized();
+
+  if (!authorized) {
+    throw new HttpError(400, "Нужна авторизация Mangabuff.");
+  }
+
+  const session = await openSavedMangabuffHttpSession();
+  const controller = new AbortController();
+  cardLockingAbortController = controller;
+  Object.assign(cardLockingRuntime, createEmptyCardLockingRuntime(), {
+    status: "running",
+    mode: request.mode,
+    threshold: request.threshold,
+    requestedLimit: request.recentLimit,
+    startedAt: new Date().toISOString(),
+  } satisfies Partial<CardLockingRuntimeState>);
+
+  logInfo("Card locking started", {
+    mode: request.mode,
+    recentLimit: request.recentLimit,
+    threshold: request.threshold,
+  });
+
+  void runCardLockingInHttpSession(session, {
+    mode: request.mode,
+    threshold: request.threshold,
+    recentLimit: request.recentLimit,
+    signal: controller.signal,
+    onProgress: updateCardLockingProgress,
+  })
+    .then((result) => {
+      updateCardLockingProgress(result);
+      cardLockingRuntime.status = result.cancelled ? "cancelled" : "completed";
+    })
+    .catch((error) => {
+      cardLockingRuntime.status = controller.signal.aborted ? "cancelled" : "error";
+      cardLockingRuntime.lastError = formatError(error);
+      logError("Card locking failed", { error: cardLockingRuntime.lastError });
+    })
+    .finally(async () => {
+      cardLockingRuntime.finishedAt = new Date().toISOString();
+      cardLockingRuntime.currentCardId = undefined;
+      cardLockingRuntime.currentPage = undefined;
+      cardLockingAbortController = undefined;
+
+      await saveCardLockingSession(session).catch((error) => {
+        logWarn("Could not persist Mangabuff cookies after card locking", {
+          error: formatError(error),
+        });
+      });
+
+      logInfo("Card locking stopped", {
+        checkedCount: cardLockingRuntime.checkedCount,
+        errorCount: cardLockingRuntime.errorCount,
+        lockedCount: cardLockingRuntime.lockedCount,
+        status: cardLockingRuntime.status,
+      });
+    });
+}
+
+function stopCardLocking(): void {
+  if (!cardLockingAbortController) {
+    return;
+  }
+
+  cardLockingRuntime.status = "stopping";
+  cardLockingAbortController.abort();
+}
+
+function updateCardLockingProgress(progress: CardLockingProgress): void {
+  Object.assign(cardLockingRuntime, {
+    mode: progress.mode,
+    threshold: progress.threshold,
+    requestedLimit: progress.requestedLimit,
+    totalCount: progress.totalCount,
+    checkedCount: progress.checkedCount,
+    lockedCount: progress.lockedCount,
+    alreadyLockedCount: progress.alreadyLockedCount,
+    belowThresholdCount: progress.belowThresholdCount,
+    errorCount: progress.errorCount,
+    pagesProcessed: progress.pagesProcessed,
+    currentPage: progress.currentPage,
+    currentCardId: progress.currentCardId,
+    errors: [...progress.errors],
+  });
+}
+
+function createEmptyCardLockingRuntime(): CardLockingRuntimeState {
+  return {
+    status: "idle",
+    checkedCount: 0,
+    lockedCount: 0,
+    alreadyLockedCount: 0,
+    belowThresholdCount: 0,
+    errorCount: 0,
+    pagesProcessed: 0,
+    errors: [],
+  };
+}
+
 async function startManualAuth(): Promise<void> {
   if (manualAuthSession) {
     if (await focusManualAuth(manualAuthSession)) {
@@ -381,6 +551,7 @@ function buildState(db: AppDatabase): object {
   return {
     settings: sanitizeSettings(loadRuntimeSettings(db)),
     runtime,
+    cardLocking: cardLockingRuntime,
     auth: {
       ...authRuntime,
       manualAuthActive: Boolean(manualAuthSession),
@@ -456,6 +627,9 @@ function sanitizeSettings(settings: BotSettings): object {
     autoAcceptEnabled: settings.autoAcceptEnabled,
     autoAcceptLocked: false,
     maxWantedPagesExclusive: settings.maxWantedPagesExclusive,
+    lockAllWantedPagesThreshold: settings.lockAllWantedPagesThreshold,
+    lockRecentWantedPagesThreshold: settings.lockRecentWantedPagesThreshold,
+    lockRecentCardsLimit: settings.lockRecentCardsLimit,
     loopPauseMs: settings.loopPauseMs,
     browserMode: settings.browserMode,
     rankRecognitionVerified: settings.rankRecognitionVerified,
@@ -486,6 +660,24 @@ function parseSettingsPatch(body: unknown): Partial<BotSettings> {
     }
 
     patch.maxWantedPagesExclusive = value;
+  }
+
+  if (source.lockAllWantedPagesThreshold !== undefined) {
+    patch.lockAllWantedPagesThreshold = parseWantedPagesThreshold(
+      source.lockAllWantedPagesThreshold,
+      "Порог для всех карт",
+    );
+  }
+
+  if (source.lockRecentWantedPagesThreshold !== undefined) {
+    patch.lockRecentWantedPagesThreshold = parseWantedPagesThreshold(
+      source.lockRecentWantedPagesThreshold,
+      "Порог для недавних карт",
+    );
+  }
+
+  if (source.lockRecentCardsLimit !== undefined) {
+    patch.lockRecentCardsLimit = parseRecentCardsLimit(source.lockRecentCardsLimit);
   }
 
   if (source.loopPauseMs !== undefined) {
@@ -523,6 +715,51 @@ function parseSettingsPatch(body: unknown): Partial<BotSettings> {
   }
 
   return patch;
+}
+
+function parseCardLockingStartRequest(body: unknown): {
+  mode: CardLockingMode;
+  threshold: number;
+  recentLimit?: number;
+} {
+  if (!body || typeof body !== "object") {
+    throw new HttpError(400, "Некорректные параметры проверки карт.");
+  }
+
+  const source = body as Record<string, unknown>;
+
+  if (source.mode !== "all" && source.mode !== "recent") {
+    throw new HttpError(400, 'Режим проверки карт должен быть "all" или "recent".');
+  }
+
+  const threshold = parseWantedPagesThreshold(source.threshold, "Порог страниц желающих");
+  const recentLimit = source.mode === "recent" ? parseRecentCardsLimit(source.recentLimit) : undefined;
+
+  return {
+    mode: source.mode,
+    threshold,
+    recentLimit,
+  };
+}
+
+function parseWantedPagesThreshold(value: unknown, label: string): number {
+  const parsed = Number(value);
+
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 100) {
+    throw new HttpError(400, `${label} должен быть целым числом от 1 до 100.`);
+  }
+
+  return parsed;
+}
+
+function parseRecentCardsLimit(value: unknown): number {
+  const parsed = Number(value);
+
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 100_000) {
+    throw new HttpError(400, "Количество недавних карт должно быть целым числом от 1 до 100000.");
+  }
+
+  return parsed;
 }
 
 async function readJsonBody(request: Request): Promise<unknown> {

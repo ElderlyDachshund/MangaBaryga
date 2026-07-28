@@ -242,6 +242,9 @@ export function saveSettingsPatch(db: AppDatabase, patch: Partial<BotSettings>):
     "safeMode",
     "autoAcceptEnabled",
     "maxWantedPagesExclusive",
+    "lockAllWantedPagesThreshold",
+    "lockRecentWantedPagesThreshold",
+    "lockRecentCardsLimit",
     "loopPauseMs",
     "browserMode",
     "rankRecognitionVerified",
@@ -367,6 +370,21 @@ function applyStoredSetting(settings: BotSettings, key: string, value: string): 
     case "maxWantedPagesExclusive":
       if (typeof parsed === "number" && Number.isInteger(parsed) && parsed > 0) {
         settings.maxWantedPagesExclusive = parsed;
+      }
+      break;
+    case "lockAllWantedPagesThreshold":
+      if (typeof parsed === "number" && Number.isInteger(parsed) && parsed > 0) {
+        settings.lockAllWantedPagesThreshold = parsed;
+      }
+      break;
+    case "lockRecentWantedPagesThreshold":
+      if (typeof parsed === "number" && Number.isInteger(parsed) && parsed > 0) {
+        settings.lockRecentWantedPagesThreshold = parsed;
+      }
+      break;
+    case "lockRecentCardsLimit":
+      if (typeof parsed === "number" && Number.isInteger(parsed) && parsed > 0) {
+        settings.lockRecentCardsLimit = parsed;
       }
       break;
     case "loopPauseMs":

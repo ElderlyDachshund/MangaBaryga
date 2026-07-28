@@ -35,6 +35,7 @@ import {
 } from "./ranks.js";
 import { passesDefaultRankRule, passesWantedPagesRule } from "./rules.js";
 import { sendAuthRequiredNotification, sendTradeProblemNotification } from "./telegram.js";
+import { buildWantedOffersUrl, countWantedUsersPagesFromHtml } from "./wanted-pages.js";
 
 const tradePassTimeoutMs = readIntegerEnv("MANGABUFF_TRADE_PASS_TIMEOUT_MS", 600_000, 45_000, 3_600_000);
 const tradePauseMinMs = readIntegerEnv("MANGABUFF_TRADE_PAUSE_MIN_MS", 6_000, 0, 60_000);
@@ -1143,26 +1144,6 @@ async function fetchWantedUsersPageHtml(page: Page, requestedCard: TradeCard): P
   }
 }
 
-function countWantedUsersPagesFromHtml(html: string): number {
-  const paginationPagesCount = readPaginationPagesCountFromHtml(html);
-
-  if (paginationPagesCount !== undefined) {
-    return paginationPagesCount;
-  }
-
-  const text = htmlToText(html);
-
-  if (hasEmptyWantedUsersText(text)) {
-    return 0;
-  }
-
-  if (html.includes("card-show__owner") || /href=["']\/users\/\d+/i.test(html)) {
-    return 1;
-  }
-
-  return 0;
-}
-
 function readPaginationPagesCountFromHtml(html: string): number | undefined {
   const pageNumbers = [...html.matchAll(/\bhref\s*=\s*(["'])(.*?)\1/gis)]
     .map((match) => readPageNumberFromHref(match[2]))
@@ -1211,16 +1192,6 @@ function htmlToText(html: string): string {
       .replace(/<style[\s\S]*?<\/style>/gi, " ")
       .replace(/<[^>]+>/g, " "),
   )?.toLowerCase() ?? "";
-}
-
-function hasEmptyWantedUsersText(text: string): boolean {
-  return [
-    "никто не хочет получить",
-    "нет желающих",
-    "нет пользователей",
-    "пользователей не найдено",
-    "список пуст",
-  ].some((emptyText) => text.includes(emptyText));
 }
 
 async function openRequestedCardPage(page: Page, requestedCard: TradeCard): Promise<void> {
@@ -1537,10 +1508,6 @@ async function readCards(cardLinks: Locator): Promise<TradeCard[]> {
   }
 
   return cards;
-}
-
-function buildWantedOffersUrl(cardId: string): string {
-  return `https://mangabuff.ru/cards/${cardId}/offers/want`;
 }
 
 function normalizeText(value: string | null | undefined): string | undefined {

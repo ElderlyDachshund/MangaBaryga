@@ -1,7 +1,9 @@
 import {
   CircleAlert,
   ExternalLink,
+  History,
   KeyRound,
+  Lock,
   MousePointerClick,
   Play,
   RefreshCw,
@@ -20,7 +22,9 @@ import {
   saveSettings,
   startAuth,
   startBot,
+  startCardLocking,
   stopBot,
+  stopCardLocking,
   type ApiRuntimePass,
   type ApiSettings,
   type ApiState,
@@ -36,6 +40,9 @@ interface SettingsForm {
   telegramBotToken: string;
   telegramChatId: string;
   maxWantedPagesExclusive: string;
+  lockAllWantedPagesThreshold: string;
+  lockRecentWantedPagesThreshold: string;
+  lockRecentCardsLimit: string;
   loopPauseMs: string;
   browserMode: BotSettings["browserMode"];
   safeMode: boolean;
@@ -50,6 +57,7 @@ export function App() {
   const [settingsForm, setSettingsForm] = useState<SettingsForm>(createEmptySettingsForm());
   const [message, setMessage] = useState<Message>();
   const [authMessage, setAuthMessage] = useState<Message>();
+  const [cardMessage, setCardMessage] = useState<Message>();
   const [busyAction, setBusyAction] = useState<string>();
 
   const refreshState = useCallback(async () => {
@@ -84,12 +92,27 @@ export function App() {
     }
   }
 
+  async function runCardAction(name: string, action: () => Promise<void>): Promise<void> {
+    setBusyAction(name);
+
+    try {
+      await action();
+    } catch (error) {
+      setCardMessage({ kind: "error", text: formatError(error) });
+    } finally {
+      setBusyAction(undefined);
+    }
+  }
+
   async function saveSettingsForm(): Promise<void> {
     await runAction("save-settings", async () => {
       const patch = {
         telegramBotToken: settingsForm.telegramBotToken,
         telegramChatId: settingsForm.telegramChatId,
         maxWantedPagesExclusive: Number(settingsForm.maxWantedPagesExclusive),
+        lockAllWantedPagesThreshold: Number(settingsForm.lockAllWantedPagesThreshold),
+        lockRecentWantedPagesThreshold: Number(settingsForm.lockRecentWantedPagesThreshold),
+        lockRecentCardsLimit: Number(settingsForm.lockRecentCardsLimit),
         loopPauseMs: Number(settingsForm.loopPauseMs),
         browserMode: settingsForm.browserMode,
         safeMode: settingsForm.safeMode,
@@ -117,6 +140,58 @@ export function App() {
         text: mode === "auto" ? "Включён режим принятия обменов." : "Включён безопасный режим.",
       });
       await refreshState();
+    });
+  }
+
+  async function beginCardLocking(mode: "all" | "recent"): Promise<void> {
+    const threshold = Number(
+      mode === "all"
+        ? settingsForm.lockAllWantedPagesThreshold
+        : settingsForm.lockRecentWantedPagesThreshold,
+    );
+    const recentLimit = mode === "recent" ? Number(settingsForm.lockRecentCardsLimit) : undefined;
+    const scopeText =
+      mode === "all" ? "все карты аккаунта" : `${recentLimit ?? 0} последних карт`;
+
+    if (!Number.isInteger(threshold) || threshold < 1 || threshold > 100) {
+      setCardMessage({
+        kind: "error",
+        text: "Порог страниц желающих должен быть целым числом от 1 до 100.",
+      });
+      return;
+    }
+
+    if (
+      mode === "recent" &&
+      (!Number.isInteger(recentLimit) || (recentLimit ?? 0) < 1 || (recentLimit ?? 0) > 100_000)
+    ) {
+      setCardMessage({
+        kind: "error",
+        text: "Количество недавних карт должно быть целым числом от 1 до 100000.",
+      });
+      return;
+    }
+
+    if (
+      !window.confirm(
+        `Проверить ${scopeText} и заблокировать каждый открытый экземпляр с ${threshold} и более страницами желающих? Автоматического разблокирования не будет.`,
+      )
+    ) {
+      return;
+    }
+
+    await runCardAction(`start-card-locking-${mode}`, async () => {
+      setState(
+        await startCardLocking({
+          mode,
+          threshold,
+          recentLimit,
+        }),
+      );
+      setCardMessage({
+        kind: "notice",
+        text: mode === "all" ? "Проверка всех карт запущена." : "Проверка недавних карт запущена.",
+      });
     });
   }
 
@@ -272,11 +347,29 @@ export function App() {
             <Tabs className="min-w-0" defaultValue="trades">
               <TabsList>
                 <TabsTrigger value="trades">Обмены</TabsTrigger>
+                <TabsTrigger value="cards">Карты</TabsTrigger>
                 <TabsTrigger value="settings">Настройки</TabsTrigger>
               </TabsList>
 
               <TabsContent className="min-w-0" value="trades">
                 <TradesTable trades={state?.trades ?? []} />
+              </TabsContent>
+
+              <TabsContent className="min-w-0" value="cards">
+                <CardLockingPanel
+                  busyAction={busyAction}
+                  message={cardMessage}
+                  onChange={setSettingsForm}
+                  onStart={(mode) => void beginCardLocking(mode)}
+                  onStop={() =>
+                    void runCardAction("stop-card-locking", async () => {
+                      setState(await stopCardLocking());
+                      setCardMessage({ kind: "notice", text: "Остановка проверки запрошена." });
+                    })
+                  }
+                  runtime={state?.cardLocking}
+                  settings={settingsForm}
+                />
               </TabsContent>
 
               <TabsContent className="min-w-0" value="settings">
@@ -397,6 +490,210 @@ export function App() {
       </div>
     </div>
   );
+}
+
+function CardLockingPanel({
+  busyAction,
+  message,
+  onChange,
+  onStart,
+  onStop,
+  runtime,
+  settings,
+}: {
+  busyAction?: string;
+  message: Message;
+  onChange: React.Dispatch<React.SetStateAction<SettingsForm>>;
+  onStart: (mode: "all" | "recent") => void;
+  onStop: () => void;
+  runtime: ApiState["cardLocking"] | undefined;
+  settings: SettingsForm;
+}) {
+  const isRunning = runtime?.status === "running" || runtime?.status === "stopping";
+  const progressPercent =
+    runtime?.totalCount && runtime.totalCount > 0
+      ? Math.min(100, Math.round((runtime.checkedCount / runtime.totalCount) * 100))
+      : 0;
+
+  return (
+    <div className="grid gap-5">
+      <section className="rounded-md border border-stone-200 bg-white p-4 shadow-sm">
+        <div className="border-b border-stone-200 pb-4">
+          <h3 className="text-base font-semibold">Массовая блокировка карт</h3>
+          <p className="mt-1 text-sm text-stone-500">
+            Карты только закрываются. Уже закрытые экземпляры не меняются, автоматического открытия нет.
+          </p>
+        </div>
+
+        <div className="mt-4 grid gap-4 lg:grid-cols-2">
+          <div className="rounded-md border border-stone-200 p-4">
+            <div className="flex items-center gap-2">
+              <Lock className="size-4 text-stone-500" />
+              <h4 className="font-semibold">Все карты</h4>
+            </div>
+            <p className="mt-1 text-sm text-stone-500">
+              Проверить всю коллекцию, все ранги и каждый физический экземпляр.
+            </p>
+            <div className="mt-4 grid gap-3">
+              <Field label="Блокировать при количестве страниц">
+                <Input
+                  max={100}
+                  min={1}
+                  onChange={(event) =>
+                    onChange((current) => ({
+                      ...current,
+                      lockAllWantedPagesThreshold: event.target.value,
+                    }))
+                  }
+                  step={1}
+                  type="number"
+                  value={settings.lockAllWantedPagesThreshold}
+                />
+              </Field>
+              <Button
+                disabled={isRunning || busyAction === "start-card-locking-all"}
+                onClick={() => onStart("all")}
+              >
+                <Lock />
+                Проверить все карты
+              </Button>
+            </div>
+          </div>
+
+          <div className="rounded-md border border-stone-200 p-4">
+            <div className="flex items-center gap-2">
+              <History className="size-4 text-stone-500" />
+              <h4 className="font-semibold">Недавние карты</h4>
+            </div>
+            <p className="mt-1 text-sm text-stone-500">
+              Идти от самых новых карт по порядку и переходить на следующие страницы до заданного лимита.
+            </p>
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              <Field label="Сколько последних карт">
+                <Input
+                  max={100_000}
+                  min={1}
+                  onChange={(event) =>
+                    onChange((current) => ({
+                      ...current,
+                      lockRecentCardsLimit: event.target.value,
+                    }))
+                  }
+                  step={1}
+                  type="number"
+                  value={settings.lockRecentCardsLimit}
+                />
+              </Field>
+              <Field label="Блокировать при страницах">
+                <Input
+                  max={100}
+                  min={1}
+                  onChange={(event) =>
+                    onChange((current) => ({
+                      ...current,
+                      lockRecentWantedPagesThreshold: event.target.value,
+                    }))
+                  }
+                  step={1}
+                  type="number"
+                  value={settings.lockRecentWantedPagesThreshold}
+                />
+              </Field>
+              <Button
+                className="sm:col-span-2"
+                disabled={isRunning || busyAction === "start-card-locking-recent"}
+                onClick={() => onStart("recent")}
+              >
+                <History />
+                Проверить недавние карты
+              </Button>
+            </div>
+          </div>
+        </div>
+
+        <InlineMessage message={message} />
+      </section>
+
+      <section className="rounded-md border border-stone-200 bg-white p-4 shadow-sm">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <div className="flex items-center gap-2">
+              <h3 className="text-base font-semibold">Ход проверки</h3>
+              <CardLockingStatusBadge status={runtime?.status ?? "idle"} />
+            </div>
+            <p className="mt-1 text-sm text-stone-500">{formatCardLockingSummary(runtime)}</p>
+          </div>
+          <Button
+            disabled={!isRunning || runtime?.status === "stopping" || busyAction === "stop-card-locking"}
+            onClick={onStop}
+            variant="destructive"
+          >
+            <Square />
+            Остановить
+          </Button>
+        </div>
+
+        <div className="mt-4 h-2 overflow-hidden rounded-full bg-stone-100">
+          <div
+            className="h-full rounded-full bg-emerald-700 transition-[width]"
+            style={{ width: `${progressPercent}%` }}
+          />
+        </div>
+
+        <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
+          <Metric label="Проверено" value={runtime?.checkedCount ?? 0} />
+          <Metric label="Всего" value={runtime?.totalCount ?? 0} />
+          <Metric label="Заблокировано" tone="good" value={runtime?.lockedCount ?? 0} />
+          <Metric label="Уже закрыто" value={runtime?.alreadyLockedCount ?? 0} />
+          <Metric label="Ниже порога" value={runtime?.belowThresholdCount ?? 0} />
+          <Metric label="Ошибки" tone="bad" value={runtime?.errorCount ?? 0} />
+        </div>
+
+        {runtime?.lastError ? (
+          <div className="mt-4 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">
+            {runtime.lastError}
+          </div>
+        ) : null}
+
+        {runtime?.errors.length ? (
+          <div className="mt-4">
+            <h4 className="text-sm font-semibold">Отчёт об ошибках</h4>
+            <div className="mt-2 max-h-64 overflow-auto rounded-md border border-stone-200">
+              {runtime.errors.map((error, index) => (
+                <div
+                  className="border-b border-stone-100 px-3 py-2 text-sm text-stone-700 last:border-0"
+                  key={`${error.instanceId ?? error.cardId ?? "error"}-${index}`}
+                >
+                  {formatCardLockingError(error)}
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+      </section>
+    </div>
+  );
+}
+
+function CardLockingStatusBadge({ status }: { status: ApiState["cardLocking"]["status"] }) {
+  const labels: Record<ApiState["cardLocking"]["status"], string> = {
+    idle: "Не запускалась",
+    running: "Работает",
+    stopping: "Останавливается",
+    completed: "Завершена",
+    cancelled: "Остановлена",
+    error: "Ошибка",
+  };
+  const variants: Record<ApiState["cardLocking"]["status"], BadgeProps["variant"]> = {
+    idle: "default",
+    running: "good",
+    stopping: "warn",
+    completed: "good",
+    cancelled: "warn",
+    error: "bad",
+  };
+
+  return <Badge variant={variants[status]}>{labels[status]}</Badge>;
 }
 
 function TradesTable({ trades }: { trades: TradeRecord[] }) {
@@ -629,6 +926,9 @@ function createEmptySettingsForm(): SettingsForm {
     telegramBotToken: "",
     telegramChatId: "",
     maxWantedPagesExclusive: "5",
+    lockAllWantedPagesThreshold: "5",
+    lockRecentWantedPagesThreshold: "5",
+    lockRecentCardsLimit: "100",
     loopPauseMs: "5000",
     browserMode: "headless",
     safeMode: true,
@@ -640,6 +940,9 @@ function mergeSettingsIntoForm(current: SettingsForm, settings: ApiSettings): Se
   return {
     ...current,
     maxWantedPagesExclusive: String(settings.maxWantedPagesExclusive),
+    lockAllWantedPagesThreshold: String(settings.lockAllWantedPagesThreshold),
+    lockRecentWantedPagesThreshold: String(settings.lockRecentWantedPagesThreshold),
+    lockRecentCardsLimit: String(settings.lockRecentCardsLimit),
     loopPauseMs: String(settings.loopPauseMs),
     browserMode: settings.browserMode,
     safeMode: settings.safeMode,
@@ -728,6 +1031,43 @@ function formatTelegramStatus(settings: ApiSettings | undefined): string {
   }
 
   return settings.telegramChatId ? `настроен (${settings.telegramChatId})` : "настроен";
+}
+
+function formatCardLockingSummary(runtime: ApiState["cardLocking"] | undefined): string {
+  if (!runtime || runtime.status === "idle") {
+    return "Проверки карт ещё не запускались.";
+  }
+
+  const scope =
+    runtime.mode === "recent"
+      ? `${runtime.requestedLimit ?? 0} недавних карт`
+      : "вся коллекция";
+  const threshold = runtime.threshold ?? 0;
+  const progress = runtime.totalCount
+    ? `${runtime.checkedCount} из ${runtime.totalCount}`
+    : String(runtime.checkedCount);
+
+  if (runtime.status === "running" || runtime.status === "stopping") {
+    const current =
+      runtime.currentPage || runtime.currentCardId
+        ? ` Страница ${runtime.currentPage ?? "—"}, карта #${runtime.currentCardId ?? "—"}.`
+        : "";
+
+    return `${scope}, порог ${threshold}+: проверено ${progress}.${current}`;
+  }
+
+  const finishedAt = runtime.finishedAt ? ` Завершено: ${formatDate(runtime.finishedAt)}.` : "";
+  return `${scope}, порог ${threshold}+: проверено ${progress}, заблокировано ${runtime.lockedCount}, ошибок ${runtime.errorCount}.${finishedAt}`;
+}
+
+function formatCardLockingError(error: ApiState["cardLocking"]["errors"][number]): string {
+  const context = [
+    error.page ? `страница ${error.page}` : undefined,
+    error.cardId ? `карта #${error.cardId}` : undefined,
+    error.instanceId ? `экземпляр #${error.instanceId}` : undefined,
+  ].filter(Boolean);
+
+  return `${context.length > 0 ? `${context.join(", ")}: ` : ""}${error.reason}`;
 }
 
 function formatError(error: unknown): string {
