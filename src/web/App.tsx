@@ -60,14 +60,17 @@ export function App() {
   const [cardMessage, setCardMessage] = useState<Message>();
   const [busyAction, setBusyAction] = useState<string>();
 
-  const refreshState = useCallback(async () => {
+  const refreshState = useCallback(async (options: { syncSettings?: boolean } = {}) => {
     const nextState = await loadState();
     setState(nextState);
-    setSettingsForm((current) => mergeSettingsIntoForm(current, nextState.settings));
+
+    if (options.syncSettings) {
+      setSettingsForm((current) => mergeSettingsIntoForm(current, nextState.settings));
+    }
   }, []);
 
   useEffect(() => {
-    void refreshState().catch((error) => {
+    void refreshState({ syncSettings: true }).catch((error) => {
       setMessage({ kind: "error", text: formatError(error) });
     });
 
@@ -119,12 +122,17 @@ export function App() {
         autoAcceptEnabled: settingsForm.autoAcceptEnabled,
       };
 
-      await saveSettings(patch);
-      setSettingsForm((current) => ({
-        ...current,
-        telegramBotToken: "",
-        telegramChatId: "",
-      }));
+      const nextSettings = await saveSettings(patch);
+      setSettingsForm((current) =>
+        mergeSettingsIntoForm(
+          {
+            ...current,
+            telegramBotToken: "",
+            telegramChatId: "",
+          },
+          nextSettings,
+        ),
+      );
       setMessage({ kind: "notice", text: "Настройки сохранены." });
       await refreshState();
     });
