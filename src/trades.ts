@@ -5,8 +5,10 @@ import {
   insertNewTrade,
   markTradeTelegramSent,
   markMissingTradesAsStale,
+  markVisibleTradesSeen,
   recordTradeAcceptAttempt,
   recordTradeCheckFailure,
+  recordTradeDetailCheck,
   updateTradeParsedData,
   updateTradeRankRuleResult,
   updateTradeStatus,
@@ -17,8 +19,15 @@ import {
   mangabuffTradesUrl,
   isMangabuffAuthorized,
   openSavedMangabuffSession,
+  saveBrowserSessionState,
   type BrowserSession,
 } from "./browser.js";
+import {
+  addPositiveJitterMs,
+  assertMangabuffPageReady,
+  clickVerified,
+  MangabuffInteractionBlockedError,
+} from "./browser-safety.js";
 import {
   isMangabuffAuthorizedHttpResponse,
   openSavedMangabuffHttpSession,
@@ -37,10 +46,22 @@ import { passesDefaultRankRule, passesWantedPagesRule } from "./rules.js";
 import { sendAuthRequiredNotification, sendTradeProblemNotification } from "./telegram.js";
 import { buildWantedOffersUrl, countWantedUsersPagesFromHtml } from "./wanted-pages.js";
 
-const tradePassTimeoutMs = readIntegerEnv("MANGABUFF_TRADE_PASS_TIMEOUT_MS", 600_000, 45_000, 3_600_000);
-const tradePauseMinMs = readIntegerEnv("MANGABUFF_TRADE_PAUSE_MIN_MS", 6_000, 0, 60_000);
-const tradePauseMaxMs = readIntegerEnv("MANGABUFF_TRADE_PAUSE_MAX_MS", 10_000, 0, 60_000);
+const tradePassTimeoutMs = readIntegerEnv("MANGABUFF_TRADE_PASS_TIMEOUT_MS", 3_600_000, 45_000, 3_600_000);
+const tradePauseMinMs = readIntegerEnv("MANGABUFF_TRADE_PAUSE_MIN_MS", 10_000, 0, 60_000);
+const tradePauseMaxMs = readIntegerEnv("MANGABUFF_TRADE_PAUSE_MAX_MS", 15_000, 0, 60_000);
 const tradeListMaxPages = readIntegerEnv("MANGABUFF_TRADE_LIST_MAX_PAGES", 10, 1, 50);
+const maxTradeDetailsPerPass = readIntegerEnv("MANGABUFF_TRADE_DETAILS_PER_PASS", 5, 1, 5);
+const unchangedTradeDetailCooldownMs = readIntegerEnv(
+  "MANGABUFF_TRADE_DETAIL_COOLDOWN_MS",
+  24 * 60 * 60 * 1_000,
+  60_000,
+  7 * 24 * 60 * 60 * 1_000,
+);
+const backgroundPageIntervals = [
+  { intervalMs: 3 * 60_000, url: "https://mangabuff.ru/feed" },
+  { intervalMs: 10 * 60_000, url: "https://mangabuff.ru/" },
+  { intervalMs: 20 * 60_000, url: "https://mangabuff.ru/manga" },
+] as const;
 
 export interface VisibleTrade {
   tradeId: string;
@@ -75,6 +96,12 @@ export interface TradesLoopOptions {
 
 export type BotSettingsSource = BotSettings | (() => BotSettings);
 
+interface BackgroundPageScheduleEntry {
+  intervalMs: number;
+  nextVisitAt: number;
+  url: string;
+}
+
 export type TradesPassResult =
   | (ScanTradesResult & {
       status: "ok";
@@ -89,24 +116,31 @@ export type TradesPassResult =
       status: "auth_required";
       passNumber: number;
       reason: string;
+    }
+  | {
+      status: "blocked";
+      passNumber: number;
+      reason: string;
     };
 
 export async function scanVisibleTrades(
   db: AppDatabase,
   settings: BotSettings,
 ): Promise<ScanTradesResult> {
-  const session = await openSavedMangabuffHttpSession();
+  const session = await openSavedMangabuffSession(settings);
 
   try {
-    return await scanVisibleTradesInHttpSession(db, session, settings);
+    const result = await scanVisibleTradesInSession(db, session, settings);
+    await saveBrowserSessionState(session).catch(() => {});
+    return result;
   } catch (error) {
     if (formatError(error) === "Нужна авторизация Mangabuff.") {
-      await sendAuthRequiredNotification(settings);
+      await sendAuthRequiredNotification(settings).catch(() => {});
     }
 
     throw error;
   } finally {
-    await session.saveStorageState();
+    await closeBrowserSession(session);
   }
 }
 
@@ -117,33 +151,103 @@ export async function runVisibleTradesLoop(
 ): Promise<void> {
   const settingsSource = options.getSettings ?? (() => settings);
   let passNumber = 0;
+  let session: BrowserSession | undefined;
+  const backgroundSchedule = createBackgroundPageSchedule();
 
-  while (!options.signal?.aborted) {
-    const session = await openSavedMangabuffHttpSession();
-    passNumber += 1;
-    const result = await runTradesPassWithTimeout(db, session, settingsSource, passNumber);
-    await session.saveStorageState();
-    options.onPass?.(result);
+  try {
+    while (!options.signal?.aborted) {
+      session ??= await openSavedMangabuffSession(resolveBotSettings(settingsSource));
+      passNumber += 1;
+      let result = await runTradesPassWithTimeout(db, session, settingsSource, passNumber);
 
-    const currentSettings = resolveBotSettings(settingsSource);
+      if (result.status === "ok") {
+        try {
+          await visitDueBackgroundPages(session.page, backgroundSchedule, options.signal);
+        } catch (error) {
+          if (error instanceof MangabuffInteractionBlockedError) {
+            result = {
+              status: "blocked",
+              passNumber,
+              reason: error.message,
+            };
+          } else {
+            throw error;
+          }
+        }
+      }
 
-    if (result.status === "auth_required") {
-      await sendAuthRequiredNotification(currentSettings);
-      break;
+      if (result.status !== "auth_required") {
+        await saveBrowserSessionState(session).catch(() => {});
+      }
+      options.onPass?.(result);
+
+      const currentSettings = resolveBotSettings(settingsSource);
+
+      if (result.status === "auth_required") {
+        await sendAuthRequiredNotification(currentSettings);
+        break;
+      }
+
+      if (result.status === "blocked") {
+        break;
+      }
+
+      if (result.status === "temporary_error" && shouldReopenBrowserSession(result.reason)) {
+        await closeBrowserSession(session);
+        session = undefined;
+      }
+
+      await waitForNextPass(currentSettings.loopPauseMs, options.signal);
+    }
+  } finally {
+    await closeBrowserSession(session);
+  }
+}
+
+function createBackgroundPageSchedule(now = Date.now()): BackgroundPageScheduleEntry[] {
+  return backgroundPageIntervals.map((entry) => ({
+    ...entry,
+    nextVisitAt: now + entry.intervalMs,
+  }));
+}
+
+async function visitDueBackgroundPages(
+  page: Page,
+  schedule: BackgroundPageScheduleEntry[],
+  signal?: AbortSignal,
+): Promise<void> {
+  for (const entry of schedule) {
+    if (signal?.aborted || Date.now() < entry.nextVisitAt) {
+      continue;
     }
 
-    await waitForNextPass(currentSettings.loopPauseMs, options.signal);
+    try {
+      const response = await page.goto(entry.url, { waitUntil: "domcontentloaded" });
+      await page.waitForTimeout(400);
+      await assertMangabuffPageReady(page, response?.status());
+    } catch (error) {
+      if (error instanceof MangabuffInteractionBlockedError) {
+        throw error;
+      }
+
+      continue;
+    }
+
+    const now = Date.now();
+    do {
+      entry.nextVisitAt += entry.intervalMs;
+    } while (entry.nextVisitAt <= now);
   }
 }
 
 async function runTradesPass(
   db: AppDatabase,
-  session: MangabuffSessionClient,
+  session: BrowserSession,
   settings: BotSettingsSource,
   passNumber: number,
 ): Promise<TradesPassResult> {
   try {
-    const scanResult = await scanVisibleTradesInHttpSession(db, session, settings);
+    const scanResult = await scanVisibleTradesInSession(db, session, settings);
     return { status: "ok", passNumber, ...scanResult };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
@@ -152,13 +256,17 @@ async function runTradesPass(
       return { status: "auth_required", passNumber, reason };
     }
 
+    if (error instanceof MangabuffInteractionBlockedError) {
+      return { status: "blocked", passNumber, reason };
+    }
+
     return { status: "temporary_error", passNumber, reason };
   }
 }
 
 async function runTradesPassWithTimeout(
   db: AppDatabase,
-  session: MangabuffSessionClient,
+  session: BrowserSession,
   settings: BotSettingsSource,
   passNumber: number,
 ): Promise<TradesPassResult> {
@@ -169,7 +277,7 @@ async function runTradesPassWithTimeout(
       resolve({
         status: "temporary_error",
         passNumber,
-        reason: `HTTP-проход проверки завис дольше ${tradePassTimeoutMs / 1_000} секунд.`,
+        reason: `Браузерный проход проверки завис дольше ${tradePassTimeoutMs / 1_000} секунд.`,
       });
     }, tradePassTimeoutMs);
   });
@@ -201,13 +309,16 @@ export async function scanVisibleTradesInHttpSession(
   settings: BotSettingsSource,
 ): Promise<ScanTradesResult> {
   const { pageCount: visibleTradePageCount, visibleTrades } = await scanVisibleTradeLinksInHttpSession(session);
+  const observations = observeVisibleTrades(db, visibleTrades);
   let insertedCount = 0;
 
-  for (const trade of visibleTrades) {
-    if (insertNewTrade(db, trade.tradeId, trade.tradeUrl)) {
+  for (const observation of observations) {
+    if (insertNewTrade(db, observation.trade.tradeId, observation.trade.tradeUrl)) {
+      observation.isNew = true;
       insertedCount += 1;
     }
   }
+  markVisibleTradesSeen(db, visibleTrades.map((trade) => trade.tradeId));
 
   const staleCount = markMissingTradesAsStale(
     db,
@@ -227,8 +338,17 @@ export async function scanVisibleTradesInHttpSession(
     skippedCount: 0,
   };
   const skippedStats = createSkippedTradeStats();
+  const tradesToProcess = selectTradesForDetailCheck(db, observations, settings);
+  const processableTradeIds = new Set(tradesToProcess.map((trade) => trade.tradeId));
 
-  for (const [index, trade] of visibleTrades.entries()) {
+  for (const trade of visibleTrades) {
+    if (!processableTradeIds.has(trade.tradeId)) {
+      processingStats.skippedCount += 1;
+      recordSkippedTrade(skippedStats, findTradeById(db, trade.tradeId), trade.tradeId);
+    }
+  }
+
+  for (const trade of tradesToProcess) {
     const tradeSettings = resolveBotSettings(settings);
     const result = await processVisibleTradeHttp(db, session, trade, tradeSettings);
     const notificationSettings = resolveBotSettings(settings);
@@ -245,16 +365,10 @@ export async function scanVisibleTradesInHttpSession(
     processingStats.ranksCheckedCount += result.ranksChecked ? 1 : 0;
     processingStats.safeAcceptCount += result.outcome === "safe_accept" ? 1 : 0;
     processingStats.acceptedCount += result.outcome === "accepted" ? 1 : 0;
-    processingStats.skippedCount += result.outcome === "skipped" ? 1 : 0;
 
     if (result.outcome === "skipped") {
+      processingStats.skippedCount += 1;
       recordSkippedTrade(skippedStats, findTradeById(db, trade.tradeId), trade.tradeId);
-    }
-
-    const nextTradeSettings = resolveBotSettings(settings);
-
-    if (result.processed && hasLaterProcessableTrade(db, visibleTrades, index, nextTradeSettings, true)) {
-      await waitBetweenTrades();
     }
   }
 
@@ -311,7 +425,7 @@ function buildTradesPageUrl(pageNumber: number): string {
   return url.toString();
 }
 
-async function scanVisibleTradesInSession(
+export async function scanVisibleTradesInSession(
   db: AppDatabase,
   session: BrowserSession,
   settings: BotSettingsSource,
@@ -323,19 +437,25 @@ async function scanVisibleTradesInSession(
   }
 
   await openOffersTab(session.page);
-  const visibleTrades = await extractVisibleTradeLinks(session.page);
+  const { fullyScanned, pageCount: visibleTradePageCount, visibleTrades } =
+    await scanVisibleTradeLinksInBrowser(session.page);
+  const observations = observeVisibleTrades(db, visibleTrades);
   let insertedCount = 0;
 
-  for (const trade of visibleTrades) {
-    if (insertNewTrade(db, trade.tradeId, trade.tradeUrl)) {
+  for (const observation of observations) {
+    if (insertNewTrade(db, observation.trade.tradeId, observation.trade.tradeUrl)) {
+      observation.isNew = true;
       insertedCount += 1;
     }
   }
+  markVisibleTradesSeen(db, visibleTrades.map((trade) => trade.tradeId));
 
-  const staleCount = markMissingTradesAsStale(
-    db,
-    visibleTrades.map((trade) => trade.tradeId),
-  );
+  const staleCount = fullyScanned
+    ? markMissingTradesAsStale(
+        db,
+        visibleTrades.map((trade) => trade.tradeId),
+      )
+    : 0;
   const processingStats = {
     processedCount: 0,
     parsedCount: 0,
@@ -350,8 +470,17 @@ async function scanVisibleTradesInSession(
     skippedCount: 0,
   };
   const skippedStats = createSkippedTradeStats();
+  const tradesToProcess = selectTradesForDetailCheck(db, observations, settings);
+  const processableTradeIds = new Set(tradesToProcess.map((trade) => trade.tradeId));
 
-  for (const [index, trade] of visibleTrades.entries()) {
+  for (const trade of visibleTrades) {
+    if (!processableTradeIds.has(trade.tradeId)) {
+      processingStats.skippedCount += 1;
+      recordSkippedTrade(skippedStats, findTradeById(db, trade.tradeId), trade.tradeId);
+    }
+  }
+
+  for (const [index, trade] of tradesToProcess.entries()) {
     const tradeSettings = resolveBotSettings(settings);
     const result = await processVisibleTrade(db, session.page, trade, tradeSettings);
     const notificationSettings = resolveBotSettings(settings);
@@ -368,15 +497,14 @@ async function scanVisibleTradesInSession(
     processingStats.ranksCheckedCount += result.ranksChecked ? 1 : 0;
     processingStats.safeAcceptCount += result.outcome === "safe_accept" ? 1 : 0;
     processingStats.acceptedCount += result.outcome === "accepted" ? 1 : 0;
-    processingStats.skippedCount += result.outcome === "skipped" ? 1 : 0;
 
     if (result.outcome === "skipped") {
+      processingStats.skippedCount += 1;
       recordSkippedTrade(skippedStats, findTradeById(db, trade.tradeId), trade.tradeId);
     }
 
-    const nextTradeSettings = resolveBotSettings(settings);
-
-    if (result.processed && hasLaterProcessableTrade(db, visibleTrades, index, nextTradeSettings, true)) {
+    if (result.processed && index < tradesToProcess.length - 1) {
+      await returnToOffersIndex(session.page);
       await waitBetweenTrades();
     }
   }
@@ -388,12 +516,112 @@ async function scanVisibleTradesInSession(
     ...processingStats,
     skippedStatusSummary: formatSkippedStatusSummary(skippedStats),
     skippedTradeIds: formatSkippedTradeIds(skippedStats),
+    visibleTradePageCount,
   };
+}
+
+async function scanVisibleTradeLinksInBrowser(
+  page: Page,
+): Promise<{ fullyScanned: boolean; pageCount: number; visibleTrades: VisibleTrade[] }> {
+  const availablePageCount = (await readPaginationPagesCount(page)) ?? 1;
+  const pageCount = Math.min(availablePageCount, tradeListMaxPages);
+  const tradesById = new Map<string, VisibleTrade>();
+
+  addVisibleTrades(tradesById, await extractVisibleTradeLinks(page));
+
+  for (let pageNumber = 2; pageNumber <= pageCount; pageNumber += 1) {
+    await openTradeListPage(page, pageNumber);
+    addVisibleTrades(tradesById, await extractVisibleTradeLinks(page));
+  }
+
+  if (pageCount > 1) {
+    await returnToOffersIndex(page);
+  }
+
+  return {
+    fullyScanned: availablePageCount <= tradeListMaxPages,
+    pageCount,
+    visibleTrades: [...tradesById.values()],
+  };
+}
+
+function addVisibleTrades(target: Map<string, VisibleTrade>, trades: VisibleTrade[]): void {
+  for (const trade of trades) {
+    target.set(trade.tradeId, trade);
+  }
+}
+
+async function openTradeListPage(page: Page, pageNumber: number): Promise<void> {
+  const pagination = page.locator(".pagination, [class*='pagination'], nav[aria-label*='страниц' i]");
+  const pageLink = pagination.locator(`a[href*="page=${pageNumber}"]`);
+
+  if (await clickFirstVisible(pageLink)) {
+    await page.waitForLoadState("domcontentloaded").catch(() => {});
+    await page.waitForTimeout(400);
+    await assertMangabuffPageReady(page);
+    return;
+  }
+
+  // Fallback only when Mangabuff did not render a clickable pagination control.
+  const response = await page.goto(buildTradesPageUrl(pageNumber), { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(400);
+  await assertMangabuffPageReady(page, response?.status());
+}
+
+async function returnToOffersIndex(page: Page): Promise<void> {
+  const offersLink = page.locator('a[href="/trades"], a[href="https://mangabuff.ru/trades"]').filter({
+    hasText: /предложения/i,
+  });
+
+  if (await clickFirstVisible(offersLink)) {
+    await page.waitForLoadState("domcontentloaded").catch(() => {});
+    await page.waitForTimeout(400);
+    await assertMangabuffPageReady(page);
+    return;
+  }
+
+  await openTradesPage(page);
 }
 
 interface SkippedTradeStats {
   statuses: Partial<Record<TradeStatus | "missing", number>>;
   tradeIds: string[];
+}
+
+interface VisibleTradeObservation {
+  isNew: boolean;
+  previousRecord?: TradeRecord;
+  trade: VisibleTrade;
+}
+
+function observeVisibleTrades(db: AppDatabase, visibleTrades: VisibleTrade[]): VisibleTradeObservation[] {
+  return visibleTrades.map((trade) => ({
+    isNew: false,
+    previousRecord: findTradeById(db, trade.tradeId),
+    trade,
+  }));
+}
+
+function selectTradesForDetailCheck(
+  db: AppDatabase,
+  observations: VisibleTradeObservation[],
+  settings: BotSettingsSource,
+): VisibleTrade[] {
+  const currentSettings = resolveBotSettings(settings);
+  const eligible = observations.filter((observation) => {
+    const record = findTradeById(db, observation.trade.tradeId);
+    const reappeared = Boolean(observation.previousRecord?.missingAt);
+
+    return shouldProcessTrade(record, currentSettings, true, observation.isNew || reappeared);
+  });
+
+  eligible.sort((left, right) => {
+    const leftPriority = left.isNew ? 0 : left.previousRecord?.missingAt ? 1 : 2;
+    const rightPriority = right.isNew ? 0 : right.previousRecord?.missingAt ? 1 : 2;
+    return leftPriority - rightPriority;
+  });
+
+  return eligible.slice(0, maxTradeDetailsPerPass).map((observation) => observation.trade);
 }
 
 function createSkippedTradeStats(): SkippedTradeStats {
@@ -478,9 +706,11 @@ async function processVisibleTradeHttp(
 ): Promise<ProcessTradeResult> {
   const record = findTradeById(db, trade.tradeId);
 
-  if (!shouldProcessTrade(record, settings, true)) {
+  if (!shouldProcessTrade(record, settings, true, true)) {
     return { processed: false, outcome: "skipped" };
   }
+
+  recordTradeDetailCheck(db, trade.tradeId);
 
   try {
     if (record?.status === "принят" && record.acceptAttempts >= 2) {
@@ -614,9 +844,11 @@ async function processVisibleTrade(
 ): Promise<ProcessTradeResult> {
   const record = findTradeById(db, trade.tradeId);
 
-  if (!shouldProcessTrade(record, settings, true)) {
+  if (!shouldProcessTrade(record, settings, true, true)) {
     return { processed: false, outcome: "skipped" };
   }
+
+  recordTradeDetailCheck(db, trade.tradeId);
 
   try {
     if (record?.status === "принят" && record.acceptAttempts >= 2) {
@@ -625,7 +857,7 @@ async function processVisibleTrade(
       return { processed: true, outcome: "manual_review" };
     }
 
-    await openTradePage(page, trade.tradeUrl);
+    await openTradeFromOffersIndex(page, trade);
     const pageState = await getTradePageState(page);
 
     if (pageState === "not_found") {
@@ -789,8 +1021,23 @@ async function acceptTradeAfterRulesPass(
   }
 
   recordTradeAcceptAttempt(db, trade.tradeId);
-  await acceptButton.click({ timeout: 5_000 });
-  await confirmAcceptIfNeeded(page);
+  await assertMangabuffPageReady(page);
+  await clickVerified(acceptButton, 'кнопка "Принять обмен"');
+  const confirmationClicked = await confirmAcceptIfNeeded(page);
+
+  if (!confirmationClicked) {
+    const status = recordTradeCheckFailure(
+      db,
+      trade.tradeId,
+      "Бот нажал принятие, но не увидел модальное подтверждение действия.",
+    );
+    return {
+      processed: true,
+      outcome: status === "ошибка_проверки" ? "check_error" : "manual_review",
+      pagesChecked: true,
+      ranksChecked: true,
+    };
+  }
 
   if (await waitForAcceptedTradeState(page, trade.tradeUrl)) {
     const reason = ruleReason.replace("Бот бы принял обмен", "Бот принял обмен");
@@ -897,18 +1144,21 @@ async function acceptTradeAfterRulesPassHttp(
   };
 }
 
-async function confirmAcceptIfNeeded(page: Page): Promise<void> {
+async function confirmAcceptIfNeeded(page: Page): Promise<boolean> {
   const confirmButton = page
     .locator('[role="dialog"] button, .modal button, [class*="modal"] button, [class*="Modal"] button')
     .filter({ hasText: /^\s*Принять\s*$/ })
     .last();
 
-  if (await confirmButton.isVisible({ timeout: 5_000 }).catch(() => false)) {
-    await confirmButton.click({ timeout: 5_000 });
+  if (!(await confirmButton.isVisible({ timeout: 5_000 }).catch(() => false))) {
+    return false;
   }
 
+  await assertMangabuffPageReady(page);
+  await clickVerified(confirmButton, 'подтверждение "Принять"');
   await page.waitForLoadState("domcontentloaded").catch(() => {});
   await page.waitForTimeout(800);
+  return true;
 }
 
 async function waitForAcceptedTradeState(page: Page, tradeUrl: string): Promise<boolean> {
@@ -1033,36 +1283,45 @@ function shouldProcessTrade(
   record: TradeRecord | undefined,
   settings: BotSettings,
   canAcceptTrades: boolean,
+  ignoreDetailCooldown = false,
 ): boolean {
   if (!record) {
     return true;
   }
 
-  if (shouldRecheckLegacyWantedPagesRecord(record)) {
-    return true;
-  }
+  let processable = shouldRecheckLegacyWantedPagesRecord(record);
 
   if (record.status === "бот_бы_принял") {
-    return canAcceptTrades && !settings.safeMode && settings.autoAcceptEnabled;
+    processable ||= canAcceptTrades && !settings.safeMode && settings.autoAcceptEnabled;
   }
 
-  if (record.status === "принят") {
-    return true;
+  if (record.status === "принят" || record.status === "неактуален" || record.status === "ошибка_проверки") {
+    processable = true;
+  } else if (isFinalTradeStatus(record.status) && !processable) {
+    return false;
+  } else if (record.status === "новое") {
+    processable = true;
   }
 
-  if (record.status === "неактуален") {
-    return true;
-  }
-
-  if (record.status === "ошибка_проверки") {
-    return true;
-  }
-
-  if (isFinalTradeStatus(record.status)) {
+  if (!processable) {
     return false;
   }
 
-  return record.status === "новое";
+  return ignoreDetailCooldown || hasTradeDetailCooldownElapsed(record);
+}
+
+function hasTradeDetailCooldownElapsed(record: TradeRecord, now = Date.now()): boolean {
+  if (!record.lastDetailCheckedAt) {
+    return true;
+  }
+
+  const checkedAt = Date.parse(
+    /(?:Z|[+-]\d{2}:\d{2})$/.test(record.lastDetailCheckedAt)
+      ? record.lastDetailCheckedAt
+      : `${record.lastDetailCheckedAt.replace(" ", "T")}Z`,
+  );
+
+  return !Number.isFinite(checkedAt) || now - checkedAt >= unchangedTradeDetailCooldownMs;
 }
 
 function shouldRecheckLegacyWantedPagesRecord(record: TradeRecord): boolean {
@@ -1071,18 +1330,6 @@ function shouldRecheckLegacyWantedPagesRecord(record: TradeRecord): boolean {
   }
 
   return [...record.requestedCards, ...record.offeredCards].some((card) => /\/cards\/[^/?#]+\/users(?:[?#]|$)/.test(card.url));
-}
-
-function hasLaterProcessableTrade(
-  db: AppDatabase,
-  visibleTrades: VisibleTrade[],
-  currentIndex: number,
-  settings: BotSettings,
-  canAcceptTrades: boolean,
-): boolean {
-  return visibleTrades
-    .slice(currentIndex + 1)
-    .some((trade) => shouldProcessTrade(findTradeById(db, trade.tradeId), settings, canAcceptTrades));
 }
 
 async function sendProblemNotificationIfNeeded(
@@ -1105,8 +1352,9 @@ function isProblemStatusForTelegram(status: TradeRecord["status"]): boolean {
 }
 
 async function countWantedPagesForRequestedCard(page: Page, requestedCard: TradeCard): Promise<number> {
-  const html = await fetchWantedUsersPageHtml(page, requestedCard);
-  return countWantedUsersPagesFromHtml(html);
+  await openRequestedCardFromTrade(page, requestedCard);
+  await openWantedUsersSection(page);
+  return countWantedUsersPages(page);
 }
 
 async function countWantedPagesForRequestedCardHttp(
@@ -1123,22 +1371,6 @@ async function countWantedPagesForRequestedCardHttp(
     }
 
     return countWantedUsersPagesFromHtml(response.text);
-  } catch (error) {
-    throw new Error(`не удалось открыть страницу запрошенной карты ${requestedCard.cardId}: ${formatError(error)}`);
-  }
-}
-
-async function fetchWantedUsersPageHtml(page: Page, requestedCard: TradeCard): Promise<string> {
-  const wantedUsersUrl = buildWantedOffersUrl(requestedCard.cardId);
-
-  try {
-    const response = await page.context().request.get(wantedUsersUrl, { timeout: 20_000 });
-
-    if (!response.ok()) {
-      throw new Error(`HTTP ${response.status()}`);
-    }
-
-    return await response.text();
   } catch (error) {
     throw new Error(`не удалось открыть страницу запрошенной карты ${requestedCard.cardId}: ${formatError(error)}`);
   }
@@ -1196,12 +1428,34 @@ function htmlToText(html: string): string {
 
 async function openRequestedCardPage(page: Page, requestedCard: TradeCard): Promise<void> {
   try {
-    await page.goto(requestedCard.url, { waitUntil: "domcontentloaded" });
+    const response = await page.goto(`https://mangabuff.ru/cards/${requestedCard.cardId}/users`, {
+      waitUntil: "domcontentloaded",
+    });
     await page.waitForLoadState("domcontentloaded").catch(() => {});
     await page.waitForTimeout(500);
+    await assertMangabuffPageReady(page, response?.status());
   } catch (error) {
+    if (error instanceof MangabuffInteractionBlockedError) {
+      throw error;
+    }
+
     throw new Error(`не удалось открыть страницу запрошенной карты ${requestedCard.cardId}: ${formatError(error)}`);
   }
+}
+
+async function openRequestedCardFromTrade(page: Page, requestedCard: TradeCard): Promise<void> {
+  const requestedCardLink = page.locator(
+    `.trade__main-items--receiver a[href*="/cards/${requestedCard.cardId}/"]`,
+  );
+
+  if (await clickFirstVisible(requestedCardLink)) {
+    await page.waitForLoadState("domcontentloaded").catch(() => {});
+    await page.waitForTimeout(500);
+    await assertMangabuffPageReady(page);
+    return;
+  }
+
+  await openRequestedCardPage(page, requestedCard);
 }
 
 async function openWantedUsersSection(page: Page): Promise<void> {
@@ -1211,9 +1465,10 @@ async function openWantedUsersSection(page: Page): Promise<void> {
     throw new Error('не удалось найти раздел "Хотят получить" на странице карты');
   }
 
-  await wantedUsersTab.click({ timeout: 5_000 }).catch(() => {});
+  await clickVerified(wantedUsersTab, 'вкладка "Хотят получить"');
   await page.waitForLoadState("domcontentloaded").catch(() => {});
   await page.waitForTimeout(500);
+  await assertMangabuffPageReady(page);
 }
 
 async function countWantedUsersPages(page: Page): Promise<number> {
@@ -1433,12 +1688,34 @@ function findFirstCardImageUrl(html: string): string | undefined {
 
 async function openTradePage(page: Page, tradeUrl: string): Promise<void> {
   try {
-    await page.goto(tradeUrl, { waitUntil: "domcontentloaded" });
+    const response = await page.goto(tradeUrl, { waitUntil: "domcontentloaded" });
     await page.waitForLoadState("domcontentloaded").catch(() => {});
     await page.waitForTimeout(500);
+    await assertMangabuffPageReady(page, response?.status());
   } catch (error) {
+    if (error instanceof MangabuffInteractionBlockedError) {
+      throw error;
+    }
+
     throw new Error(`Не удалось открыть страницу обмена: ${formatError(error)}`);
   }
+}
+
+async function openTradeFromOffersIndex(page: Page, trade: VisibleTrade): Promise<void> {
+  const currentUrl = new URL(page.url());
+
+  if (currentUrl.pathname === "/trades") {
+    const tradeLink = page.locator(`a[href="/trades/${trade.tradeId}"]`);
+
+    if (await clickFirstVisible(tradeLink)) {
+      await page.waitForLoadState("domcontentloaded").catch(() => {});
+      await page.waitForTimeout(500);
+      await assertMangabuffPageReady(page);
+      return;
+    }
+  }
+
+  await openTradePage(page, trade.tradeUrl);
 }
 
 async function getTradePageState(page: Page): Promise<"active" | "cancelled" | "accepted" | "not_found"> {
@@ -1539,8 +1816,13 @@ function validateParsedTrade(parsedTrade: ParsedTradePage): void {
 
 async function openTradesPage(page: Page): Promise<void> {
   try {
-    await page.goto(mangabuffTradesUrl, { waitUntil: "domcontentloaded" });
+    const response = await page.goto(mangabuffTradesUrl, { waitUntil: "domcontentloaded" });
+    await assertMangabuffPageReady(page, response?.status());
   } catch (error) {
+    if (error instanceof MangabuffInteractionBlockedError) {
+      throw error;
+    }
+
     throw new Error(`Не удалось загрузить вкладку предложений: ${formatError(error)}`);
   }
 
@@ -1567,6 +1849,7 @@ async function openOffersTab(page: Page): Promise<void> {
 
   await page.waitForLoadState("domcontentloaded").catch(() => {});
   await page.waitForTimeout(500);
+  await assertMangabuffPageReady(page);
 }
 
 async function clickFirstVisible(locator: Locator): Promise<boolean> {
@@ -1579,7 +1862,14 @@ async function clickFirstVisible(locator: Locator): Promise<boolean> {
       continue;
     }
 
-    await candidate.click({ timeout: 3_000 });
+    await candidate
+      .evaluate((element) => {
+        if (element instanceof HTMLAnchorElement) {
+          element.target = "_self";
+        }
+      })
+      .catch(() => {});
+    await clickVerified(candidate, "переход по видимой ссылке", 3_000);
     return true;
   }
 
@@ -1752,7 +2042,7 @@ function escapeRegExp(value: string): string {
 
 async function waitForNextPass(loopPauseMs: number, signal?: AbortSignal): Promise<void> {
   try {
-    await sleep(loopPauseMs, undefined, { signal });
+    await sleep(addPositiveJitterMs(loopPauseMs), undefined, { signal });
   } catch (error) {
     if (!signal?.aborted) {
       throw error;

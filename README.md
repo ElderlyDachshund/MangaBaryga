@@ -14,11 +14,40 @@ Use the Dockerfile when the hosting platform supports it. Otherwise set:
 Do not use a generated wrapper such as `node /app/http-wrapper.js`, and do not start
 the app before the build command has created `dist/index.js`.
 
-## Low-memory host auth
+## Browser workflow
 
-The normal bot loop uses the saved Mangabuff cookies through HTTP and does not keep
-Chromium running. On a 256 MB host, do Mangabuff login outside the host and upload
-the saved storage state file.
+The Mangabuff worker uses Playwright for the whole site workflow. It keeps one browser
+session open and behaves like the normal UI flow:
+
+1. Open the `Предложения` index and collect visible trade IDs.
+2. Compare them with the local SQLite history and open only new or retryable trades.
+3. Open the trade, click the requested card, then click `Хотят получить`.
+4. Read the visible pagination, recognize ranks from images loaded by the page, and
+   apply the existing accept/drop rules.
+5. Return to the offers index before processing the next trade.
+
+Acceptance and card locking are also done with visible page buttons. The production
+worker does not call Mangabuff endpoints through Node `fetch`, `request.get`, or a
+hand-built form POST.
+
+The offers index is the canonical signal source. A numeric ID is new only when it is
+visible there and `INSERT OR IGNORE` creates a local SQLite row. The notification page is not polled,
+because opening it can change unread state and it is less reliable than the complete
+offers list. The worker opens at most five due details per pass, waits 10–15 seconds
+between them, and cools unchanged details down for 24 hours. `discovered_at` means
+“first observed locally”, not “sent by MangaBuff”.
+
+The same single page visits `/feed` every 3 minutes, the home page every 10 minutes,
+and `/manga` every 20 minutes. Away-navigation is limited to 8 per minute and 80 per
+hour; refresh polling of an already open `/trades` index remains on the configured
+5–15 second cadence.
+
+The browser needs more memory than the old HTTP worker. Use at least 512 MB; 1 GB is
+recommended for the server, Chromium, SQLite, and the control panel together.
+
+## Browser authentication
+
+Log in locally and save Playwright storage state:
 
 Local machine:
 
@@ -35,14 +64,13 @@ Recommended host environment:
 - `MANGABUFF_STORAGE_STATE_PATH=/app/data/mangabuff.json`
 - `DATABASE_PATH=/app/data/baryga-manga.sqlite`
 - `AUTO_START_BOT=true` if the bot should start with the server
-- `MANGABUFF_LOGIN=...` and `MANGABUFF_PASSWORD=...` so the host can refresh an expired Mangabuff session by itself
+- `MANGABUFF_LOGIN=...` and `MANGABUFF_PASSWORD=...` so the host can refresh an expired Mangabuff session through the login page
 - `MANGABUFF_PROXY_URL=socks5://user:pass@proxy-host:proxy-port` if this bot should use its own proxy/IP
 - `MANGABUFF_AUTO_LOGIN_INTERVAL_HOURS=20` to refresh the saved session periodically
 - `MANGA_TELEGRAM_BOT_TOKEN=...` (or `TELEGRAM_BOT_TOKEN` on hosts where that name is editable)
 - `TELEGRAM_CHAT_ID=...`
 
-Automatic re-login is available over plain HTTP when Mangabuff login/password
-auth is enough:
+Automatic re-login uses the browser login form:
 
 ```sh
 MANGABUFF_LOGIN="email@example.com" \
@@ -52,18 +80,14 @@ npm run auth:auto
 ```
 
 For a long-running server, set `MANGABUFF_AUTO_LOGIN_INTERVAL_HOURS=20` with
-`MANGABUFF_LOGIN` and `MANGABUFF_PASSWORD`. The server will fetch `/login`, send
-the AJAX login POST with the page CSRF token, verify `/trades`, and save a fresh
-storage state file. If the login check fails, the saved session file is left
-untouched.
+`MANGABUFF_LOGIN` and `MANGABUFF_PASSWORD`. The server opens `/login`, fills the
+visible fields, submits the form, verifies `/trades`, and saves refreshed storage
+state. `npm run check-auth`, `/api/auth/status`, bot startup, trade processing, and
+card locking all use Chromium.
 
-Avoid using the panel's manual login flow on a 256 MB host. It needs Chromium and can
-exceed the memory limit. `npm run check-auth`, `/api/auth/status`, and bot startup use
-the lightweight HTTP check.
-
-The Docker image skips Chromium by default for low-memory deployments. If you really
-need browser-based login inside the container, build with
-`--build-arg INSTALL_PLAYWRIGHT=true`.
+The Docker image installs Playwright Chromium by default. Set
+`--build-arg INSTALL_PLAYWRIGHT=false` only for a web-panel-only image that will never
+run the bot.
 
 ## Vercel web panel
 
@@ -167,4 +191,5 @@ Each bot should still keep its own:
 - `MANGA_TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 
-`MANGABUFF_PROXY_URL` is used for both the lightweight HTTP Mangabuff session checks and Playwright browser sessions. Supported formats are `http://...`, `https://...`, and `socks5://...`.
+`MANGABUFF_PROXY_URL` is used by Playwright browser sessions. Supported formats are
+`http://...`, `https://...`, and `socks5://...`.

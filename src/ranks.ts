@@ -1,5 +1,9 @@
 import type { Page } from "playwright";
 import sharp from "sharp";
+import {
+  assertMangabuffPageReady,
+  MangabuffInteractionBlockedError,
+} from "./browser-safety.js";
 import { supportedRanks, type CardRank, type SupportedCardRank } from "./domain.js";
 import { rankSamples, type RankSample } from "./rank-samples.js";
 
@@ -62,9 +66,10 @@ export async function recognizeCardPageRank(
 
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      await page.goto(cardUrl, { waitUntil: "domcontentloaded", timeout: 20_000 });
+      const response = await page.goto(cardUrl, { waitUntil: "domcontentloaded", timeout: 20_000 });
       await page.waitForLoadState("networkidle", { timeout: 3_000 }).catch(() => undefined);
       await page.waitForTimeout(500);
+      await assertMangabuffPageReady(page, response?.status());
 
       const imageSrc = await page.locator('img[src*="/img/cards/"]').first().getAttribute("src", {
         timeout: 15_000,
@@ -76,6 +81,10 @@ export async function recognizeCardPageRank(
 
       return recognizeCardRankFromImage(page, imageSrc);
     } catch (error) {
+      if (error instanceof MangabuffInteractionBlockedError) {
+        throw error;
+      }
+
       lastError = error;
 
       if (attempt < 3) {

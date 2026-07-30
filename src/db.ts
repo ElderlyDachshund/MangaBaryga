@@ -25,6 +25,9 @@ CREATE TABLE IF NOT EXISTS trades (
   last_accept_attempted_at TEXT,
   telegram_sent INTEGER NOT NULL DEFAULT 0,
   discovered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_detail_checked_at TEXT,
+  missing_at TEXT,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -47,6 +50,9 @@ interface TradeRow {
   last_accept_attempted_at?: string;
   telegram_sent: 0 | 1;
   discovered_at: string;
+  last_seen_at: string;
+  last_detail_checked_at?: string;
+  missing_at?: string;
   updated_at: string;
 }
 
@@ -81,6 +87,22 @@ export function insertNewTrade(db: AppDatabase, tradeId: string, tradeUrl: strin
   return result.changes > 0;
 }
 
+export function markVisibleTradesSeen(db: AppDatabase, visibleTradeIds: string[]): number {
+  if (visibleTradeIds.length === 0) {
+    return 0;
+  }
+
+  const placeholders = visibleTradeIds.map(() => "?").join(", ");
+  return db
+    .prepare(
+      `UPDATE trades
+       SET last_seen_at = CURRENT_TIMESTAMP,
+           missing_at = NULL
+       WHERE trade_id IN (${placeholders})`,
+    )
+    .run(...visibleTradeIds).changes;
+}
+
 export function markMissingTradesAsStale(db: AppDatabase, visibleTradeIds: string[]): number {
   const staleStatuses = ["новое", "ошибка_проверки"] satisfies TradeStatus[];
   const staleReason = 'Обмен исчез из вкладки "Предложения".';
@@ -89,16 +111,33 @@ export function markMissingTradesAsStale(db: AppDatabase, visibleTradeIds: strin
   const visibleCondition =
     visibleTradeIds.length > 0 ? `AND trade_id NOT IN (${visiblePlaceholders})` : "";
 
+  db.prepare(
+    `UPDATE trades
+     SET missing_at = COALESCE(missing_at, CURRENT_TIMESTAMP)
+     WHERE 1 = 1
+     ${visibleCondition}`,
+  ).run(...visibleTradeIds);
+
   const result = db.prepare(
     `UPDATE trades
      SET status = 'неактуален',
          reason = ?,
          updated_at = CURRENT_TIMESTAMP
      WHERE status IN (${statusPlaceholders})
-     ${visibleCondition}`,
-  ).run(staleReason, ...staleStatuses, ...visibleTradeIds);
+       AND missing_at IS NOT NULL`,
+  ).run(staleReason, ...staleStatuses);
 
   return result.changes;
+}
+
+export function recordTradeDetailCheck(db: AppDatabase, tradeId: string): boolean {
+  const result = db.prepare(
+    `UPDATE trades
+     SET last_detail_checked_at = CURRENT_TIMESTAMP
+     WHERE trade_id = ?`,
+  ).run(tradeId);
+
+  return result.changes > 0;
 }
 
 export function updateTradeStatus(
@@ -302,7 +341,8 @@ export function runDatabaseMaintenance(
       ? db
           .prepare(
             `DELETE FROM trades
-             WHERE updated_at < datetime('now', ?)`,
+             WHERE updated_at < datetime('now', ?)
+               AND missing_at IS NOT NULL`,
           )
           .run(`-${retentionDays} days`).changes
       : 0;
@@ -333,6 +373,9 @@ function mapTradeRow(row: TradeRow): TradeRecord {
     lastAcceptAttemptedAt: row.last_accept_attempted_at,
     telegramSent: row.telegram_sent === 1,
     discoveredAt: row.discovered_at,
+    lastSeenAt: row.last_seen_at,
+    lastDetailCheckedAt: row.last_detail_checked_at ?? undefined,
+    missingAt: row.missing_at ?? undefined,
     updatedAt: row.updated_at,
   };
 }
@@ -388,7 +431,7 @@ function applyStoredSetting(settings: BotSettings, key: string, value: string): 
       }
       break;
     case "loopPauseMs":
-      if (typeof parsed === "number" && Number.isInteger(parsed) && parsed >= 1_000 && parsed <= 10_000) {
+      if (typeof parsed === "number" && Number.isInteger(parsed) && parsed >= 5_000 && parsed <= 15_000) {
         settings.loopPauseMs = parsed;
       }
       break;
@@ -409,6 +452,14 @@ function migrateDatabase(db: AppDatabase): void {
   ensureColumn(db, "trades", "rank_rule_result", "TEXT NOT NULL DEFAULT 'не_проверялось'");
   ensureColumn(db, "trades", "telegram_sent", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "trades", "last_accept_attempted_at", "TEXT");
+  ensureColumn(db, "trades", "last_seen_at", "TEXT");
+  ensureColumn(db, "trades", "last_detail_checked_at", "TEXT");
+  ensureColumn(db, "trades", "missing_at", "TEXT");
+  db.prepare(
+    `UPDATE trades
+     SET last_seen_at = COALESCE(last_seen_at, discovered_at, CURRENT_TIMESTAMP)
+     WHERE last_seen_at IS NULL`,
+  ).run();
   backfillRankRuleResults(db);
 }
 

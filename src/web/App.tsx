@@ -413,8 +413,8 @@ export function App() {
                     </Field>
                     <Field label="Пауза между проходами, мс">
                       <Input
-                        max={10_000}
-                        min={1_000}
+                        max={15_000}
+                        min={5_000}
                         onChange={(event) =>
                           setSettingsForm((current) => ({
                             ...current,
@@ -719,7 +719,7 @@ function TradesTable({ trades }: { trades: TradeRecord[] }) {
               <th className="px-3 py-3">Страницы желающих</th>
               <th className="px-3 py-3">Ранги</th>
               <th className="px-3 py-3">Причина</th>
-              <th className="px-3 py-3">Обновлён</th>
+              <th className="px-3 py-3">Время</th>
             </tr>
           </thead>
           <tbody>
@@ -766,7 +766,10 @@ function TradeRow({ trade }: { trade: TradeRecord }) {
         {formatRankRule(trade.rankRuleResult)}
       </td>
       <td className="max-w-[360px] px-3 py-3 align-top text-stone-700">{trade.reason || "не указана"}</td>
-      <td className="whitespace-nowrap px-3 py-3 align-top text-stone-700">{formatDate(trade.updatedAt)}</td>
+      <td className="whitespace-nowrap px-3 py-3 align-top text-stone-700">
+        <div>Обнаружен: {formatDate(trade.discoveredAt)}</div>
+        <div className="text-xs text-stone-500">Обновлён: {formatDate(trade.updatedAt)}</div>
+      </td>
     </tr>
   );
 }
@@ -937,7 +940,7 @@ function createEmptySettingsForm(): SettingsForm {
     lockAllWantedPagesThreshold: "5",
     lockRecentWantedPagesThreshold: "5",
     lockRecentCardsLimit: "100",
-    loopPauseMs: "5000",
+    loopPauseMs: "10000",
     browserMode: "headless",
     safeMode: true,
     autoAcceptEnabled: false,
@@ -991,6 +994,10 @@ function formatLastPass(pass: ApiRuntimePass | undefined, lastError: string | un
 
   if (pass?.status === "auth_required") {
     return "Последний проход: нужна повторная авторизация Mangabuff.";
+  }
+
+  if (pass?.status === "blocked") {
+    return `Бот остановлен защитой Mangabuff. ${pass.reason}`;
   }
 
   if (lastError) {

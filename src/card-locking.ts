@@ -1,3 +1,10 @@
+import type { Page } from "playwright";
+import { isMangabuffAuthorized, type BrowserSession } from "./browser.js";
+import {
+  assertMangabuffPageReady,
+  clickVerified,
+  MangabuffInteractionBlockedError,
+} from "./browser-safety.js";
 import type { MangabuffHttpSession, MangabuffSessionClient } from "./mangabuff-http.js";
 import { formatError } from "./logger.js";
 import { buildWantedOffersUrl, countWantedUsersPagesFromHtml } from "./wanted-pages.js";
@@ -46,6 +53,274 @@ interface OwnedCardsPage {
 
 const mangabuffBaseUrl = "https://mangabuff.ru";
 const maxReportedErrors = 200;
+
+export async function runCardLockingInBrowserSession(
+  session: BrowserSession,
+  options: {
+    mode: CardLockingMode;
+    threshold: number;
+    recentLimit?: number;
+    signal?: AbortSignal;
+    onProgress?: (progress: CardLockingProgress) => void;
+  },
+): Promise<CardLockingResult> {
+  const recentLimit = options.mode === "recent" ? normalizeRecentLimit(options.recentLimit) : undefined;
+  const progress: CardLockingProgress = {
+    mode: options.mode,
+    threshold: normalizeThreshold(options.threshold),
+    requestedLimit: recentLimit,
+    checkedCount: 0,
+    lockedCount: 0,
+    alreadyLockedCount: 0,
+    belowThresholdCount: 0,
+    errorCount: 0,
+    pagesProcessed: 0,
+    errors: [],
+  };
+  const userId = await readAuthenticatedUserIdFromBrowser(session.page);
+  const wantedPagesCache = new Map<string, number>();
+  const seenInstanceIds = new Set<string>();
+  let pageNumber = 1;
+
+  while (!options.signal?.aborted) {
+    const collectionUrl = buildOwnedCardsPageUrl(userId, options.mode, pageNumber);
+    await openBrowserPage(session.page, collectionUrl, `страницу ${pageNumber} коллекции`);
+    const parsedPage = await readOwnedCardsFromBrowser(session.page);
+
+    if (pageNumber === 1) {
+      progress.totalCount =
+        parsedPage.totalCount === undefined
+          ? recentLimit
+          : recentLimit === undefined
+            ? parsedPage.totalCount
+            : Math.min(parsedPage.totalCount, recentLimit);
+    }
+
+    const remaining =
+      recentLimit === undefined ? parsedPage.instances.length : Math.max(0, recentLimit - progress.checkedCount);
+    const pageInstances = parsedPage.instances
+      .filter((instance) => !instance.instanceId || !seenInstanceIds.has(instance.instanceId))
+      .slice(0, remaining);
+
+    if (pageInstances.length === 0) {
+      break;
+    }
+
+    progress.currentPage = pageNumber;
+
+    for (const instance of pageInstances) {
+      if (options.signal?.aborted) {
+        break;
+      }
+
+      if (instance.instanceId) {
+        seenInstanceIds.add(instance.instanceId);
+      }
+
+      progress.currentCardId = instance.cardId;
+
+      if (!instance.cardId || !instance.instanceId || instance.locked === undefined) {
+        addProgressError(progress, {
+          cardId: instance.cardId,
+          instanceId: instance.instanceId,
+          page: pageNumber,
+          reason: buildIncompleteCardReason(instance),
+        });
+        progress.checkedCount += 1;
+        emitProgress(options.onProgress, progress);
+        continue;
+      }
+
+      if (instance.locked) {
+        progress.alreadyLockedCount += 1;
+        progress.checkedCount += 1;
+        emitProgress(options.onProgress, progress);
+        continue;
+      }
+
+      try {
+        let wantedPagesCount = wantedPagesCache.get(instance.cardId);
+
+        if (wantedPagesCount === undefined) {
+          wantedPagesCount = await countWantedPagesThroughBrowser(
+            session.page,
+            collectionUrl,
+            instance.cardId,
+          );
+          wantedPagesCache.set(instance.cardId, wantedPagesCount);
+        }
+
+        if (wantedPagesCount >= progress.threshold) {
+          await lockCardInstanceThroughBrowser(session.page, instance);
+          progress.lockedCount += 1;
+        } else {
+          progress.belowThresholdCount += 1;
+        }
+      } catch (error) {
+        if (error instanceof MangabuffInteractionBlockedError) {
+          throw error;
+        }
+
+        addProgressError(progress, {
+          cardId: instance.cardId,
+          instanceId: instance.instanceId,
+          page: pageNumber,
+          reason: `Не удалось проверить или заблокировать экземпляр через браузер: ${formatError(error)}`,
+        });
+        await openBrowserPage(session.page, collectionUrl, `страницу ${pageNumber} коллекции`).catch(() => {});
+      }
+
+      progress.checkedCount += 1;
+      emitProgress(options.onProgress, progress);
+    }
+
+    progress.pagesProcessed += 1;
+    progress.currentCardId = undefined;
+    emitProgress(options.onProgress, progress);
+
+    if (recentLimit !== undefined && progress.checkedCount >= recentLimit) {
+      break;
+    }
+
+    if (progress.totalCount !== undefined && progress.checkedCount >= progress.totalCount) {
+      break;
+    }
+
+    pageNumber += 1;
+  }
+
+  progress.currentCardId = undefined;
+  progress.currentPage = undefined;
+  emitProgress(options.onProgress, progress);
+
+  return {
+    ...progress,
+    errors: [...progress.errors],
+    cancelled: Boolean(options.signal?.aborted),
+  };
+}
+
+async function readAuthenticatedUserIdFromBrowser(page: Page): Promise<string> {
+  await openBrowserPage(page, mangabuffBaseUrl, "главную страницу Mangabuff");
+
+  if (!(await isMangabuffAuthorized(page))) {
+    throw new Error("Нужна авторизация Mangabuff.");
+  }
+
+  const userId = await page
+    .locator('a[href*="/users/"][href*="/bookmarks"], a[href^="/users/"]')
+    .evaluateAll((links) => {
+      for (const link of links) {
+        const match = (link as HTMLAnchorElement).href.match(/\/users\/(\d+)/);
+
+        if (match?.[1]) {
+          return match[1];
+        }
+      }
+
+      return undefined;
+    });
+
+  if (!userId) {
+    throw new Error("Не удалось определить авторизованный аккаунт Mangabuff.");
+  }
+
+  return userId;
+}
+
+async function readOwnedCardsFromBrowser(page: Page): Promise<OwnedCardsPage> {
+  const instances = await page.locator(".manga-cards__item").evaluateAll((items) =>
+    items.map((item) => {
+      const lockButton = item.querySelector<HTMLElement>(".lock-card-btn");
+      const lockIcon = lockButton?.querySelector("i");
+
+      return {
+        cardId: item.getAttribute("data-card-id") ?? undefined,
+        instanceId: lockButton?.getAttribute("data-id") ?? undefined,
+        locked: lockIcon
+          ? lockIcon.classList.contains("icon-lock")
+          : undefined,
+        title: item.getAttribute("data-name") ?? undefined,
+      };
+    }),
+  );
+  const heading = await page.locator("h1, h2, h3").filter({ hasText: /Карточки/i }).first().innerText().catch(() => "");
+  const totalCountText = heading.match(/Карточки\s+([\d\s]+)/i)?.[1];
+  const totalCount = totalCountText ? Number(totalCountText.replace(/\s+/g, "")) : undefined;
+
+  return {
+    instances,
+    totalCount: Number.isInteger(totalCount) ? totalCount : undefined,
+  };
+}
+
+async function countWantedPagesThroughBrowser(
+  page: Page,
+  collectionUrl: string,
+  cardId: string,
+): Promise<number> {
+  const cardImage = page.locator(
+    `.manga-cards__item[data-card-id="${cardId}"] .manga-cards__image`,
+  );
+
+  if (await cardImage.count() === 1 && await cardImage.isVisible().catch(() => false)) {
+    await clickVerified(cardImage, `карточка ${cardId}`);
+    await page.waitForTimeout(250);
+  }
+
+  const ownersLink = page.locator(`a[href="/cards/${cardId}/users"]`);
+
+  if (await ownersLink.count() === 1 && await ownersLink.isVisible().catch(() => false)) {
+    await clickVerified(ownersLink, `владельцы карточки ${cardId}`);
+    await page.waitForLoadState("domcontentloaded").catch(() => {});
+  } else {
+    await openBrowserPage(page, `${mangabuffBaseUrl}/cards/${cardId}/users`, `карточку ${cardId}`);
+  }
+
+  const wantedLink = page.locator(`a[href="/cards/${cardId}/offers/want"]`);
+
+  if (await wantedLink.count() !== 1 || !(await wantedLink.isVisible().catch(() => false))) {
+    throw new Error('не удалось найти вкладку "Хотят получить"');
+  }
+
+  await clickVerified(wantedLink, 'вкладка "Хотят получить"');
+  await page.waitForLoadState("domcontentloaded").catch(() => {});
+  await page.waitForTimeout(300);
+  const wantedPagesCount = countWantedUsersPagesFromHtml(await page.content());
+
+  await openBrowserPage(page, collectionUrl, "страницу коллекции");
+  return wantedPagesCount;
+}
+
+async function lockCardInstanceThroughBrowser(page: Page, instance: OwnedCardInstance): Promise<void> {
+  const lockButton = page.locator(`.lock-card-btn[data-id="${instance.instanceId}"]`);
+
+  if (await lockButton.count() !== 1 || !(await lockButton.isVisible().catch(() => false))) {
+    throw new Error(`не найдена кнопка блокировки экземпляра ${instance.instanceId}`);
+  }
+
+  await assertMangabuffPageReady(page);
+  await clickVerified(lockButton, `блокировка экземпляра ${instance.instanceId}`);
+  await page.waitForTimeout(350);
+
+  if (!(await lockButton.locator(".icon-lock").isVisible().catch(() => false))) {
+    throw new Error(`сайт не подтвердил блокировку экземпляра ${instance.instanceId}`);
+  }
+}
+
+async function openBrowserPage(page: Page, url: string, label: string): Promise<void> {
+  try {
+    const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20_000 });
+    await page.waitForTimeout(250);
+    await assertMangabuffPageReady(page, response?.status());
+  } catch (error) {
+    if (error instanceof MangabuffInteractionBlockedError) {
+      throw error;
+    }
+
+    throw new Error(`Не удалось открыть ${label}: ${formatError(error)}`);
+  }
+}
 
 export async function runCardLockingInHttpSession(
   session: MangabuffSessionClient,

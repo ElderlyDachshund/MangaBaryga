@@ -10,8 +10,8 @@ COPY . .
 RUN npm run build
 RUN test -f /opt/baryga-manga/dist/index.js && test -f /opt/baryga-manga/dist/web/index.html
 RUN npm prune --omit=dev
-ARG INSTALL_PLAYWRIGHT=false
-RUN if [ "$INSTALL_PLAYWRIGHT" = "true" ]; then node node_modules/playwright/cli.js install --with-deps --only-shell chromium; fi
+ARG INSTALL_PLAYWRIGHT=true
+RUN if [ "$INSTALL_PLAYWRIGHT" = "true" ]; then node node_modules/playwright/cli.js install --with-deps chromium; fi
 
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0

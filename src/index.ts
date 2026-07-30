@@ -1,9 +1,13 @@
 import "dotenv/config";
 import { createDefaultSettings, type TradeCard, type TradeRecord } from "./domain.js";
-import { openSavedMangabuffSession, saveMangabuffSession } from "./browser.js";
+import {
+  autoLoginMangabuffSession,
+  checkMangabuffSession,
+  openSavedMangabuffSession,
+  saveMangabuffSession,
+} from "./browser.js";
 import { listTrades, openDatabase } from "./db.js";
 import { formatError, logError, logInfo } from "./logger.js";
-import { autoLoginMangabuffHttpSession, checkSavedMangabuffHttpSession } from "./mangabuff-http.js";
 import { verifyRankSamples } from "./ranks.js";
 import { startControlServer } from "./server.js";
 import { runVisibleTradesLoop, scanVisibleTrades, type TradesPassResult } from "./trades.js";
@@ -23,7 +27,11 @@ switch (command) {
   case "auth:auto": {
     const login = readRequiredEnv("MANGABUFF_LOGIN");
     const password = readRequiredEnv("MANGABUFF_PASSWORD");
-    const saved = await autoLoginMangabuffHttpSession({ login, password });
+    const saved = await autoLoginMangabuffSession({
+      headless: settings.browserMode === "headless",
+      login,
+      password,
+    });
 
     if (saved) {
       console.log("Автологин Mangabuff выполнен, сессия сохранена.");
@@ -36,7 +44,7 @@ switch (command) {
   }
 
   case "check-auth": {
-    const isAuthorized = await checkSavedMangabuffHttpSession();
+    const isAuthorized = await checkMangabuffSession(settings);
     console.log(isAuthorized ? "Сессия Mangabuff активна." : "Нужна авторизация Mangabuff.");
     process.exitCode = isAuthorized ? 0 : 1;
     break;
@@ -158,7 +166,7 @@ switch (command) {
     console.log(`Default mode: ${settings.safeMode ? "safe" : "auto"}`);
     console.log("Commands:");
     console.log("  npm run auth       Войти в Mangabuff вручную и сохранить сессию");
-    console.log("  npm run auth:auto  Войти в Mangabuff по env-логину/паролю через HTTP и сохранить сессию");
+    console.log("  npm run auth:auto  Войти в Mangabuff через браузер и сохранить сессию");
     console.log("  npm run check-auth Проверить сохранённую сессию Mangabuff");
     console.log("  npm run scan-trades Найти видимые входящие обмены и сохранить новые");
     console.log("  npm run list-trades Показать последние записи истории обменов");
@@ -169,7 +177,7 @@ switch (command) {
     console.log("  --limit=50         Количество записей для list-trades: 1-200");
     console.log("  --headful          Открыть видимый браузер для диагностики");
     console.log("  --auto-accept      Включить рабочий режим: принимать обмены, прошедшие правила");
-    console.log("  --pause-ms=5000    Пауза между проходами: 1000-10000 мс");
+    console.log("  --pause-ms=10000   Пауза между проходами: 5000-15000 мс");
   }
 }
 
@@ -198,8 +206,8 @@ function applyCliSettings(): void {
 
   const pauseMs = Number(pauseArg.split("=")[1]);
 
-  if (!Number.isInteger(pauseMs) || pauseMs < 1_000 || pauseMs > 10_000) {
-    throw new Error("Пауза между проходами должна быть целым числом от 1000 до 10000 мс.");
+  if (!Number.isInteger(pauseMs) || pauseMs < 5_000 || pauseMs > 15_000) {
+    throw new Error("Пауза между проходами должна быть целым числом от 5000 до 15000 мс.");
   }
 
   settings.loopPauseMs = pauseMs;
@@ -245,6 +253,11 @@ function logTradesPass(result: TradesPassResult): void {
     return;
   }
 
+  if (result.status === "blocked") {
+    console.log(`[${time}] Проход ${result.passNumber}: бот остановлен. ${result.reason}`);
+    return;
+  }
+
   console.log(
     `[${time}] Проход ${result.passNumber}: видимых ${result.visibleTrades.length}, новых ${result.insertedCount}, страницы проверены ${result.pagesCheckedCount}, ранги проверены ${result.ranksCheckedCount}, принято ${result.acceptedCount}, бот бы принял ${result.safeAcceptCount}, брошено по правилам ${result.rulesDroppedCount}, ручная проверка ${result.manualReviewCount}, ошибок ${result.checkErrorCount}, неактуальных ${result.staleCount + result.pageStaleCount}, пропущено ${result.skippedCount}.`,
   );
@@ -269,7 +282,8 @@ function readListLimit(): number {
 function formatTradeRecord(trade: TradeRecord): string {
   return [
     `#${trade.tradeId} ${trade.status}`,
-    `  Обновлён: ${trade.updatedAt}; найден: ${trade.discoveredAt}`,
+    `  Обнаружен: ${trade.discoveredAt}; обновлён: ${trade.updatedAt}; последний раз виден: ${trade.lastSeenAt}`,
+    `  Detail проверен: ${trade.lastDetailCheckedAt ?? "не проверялся"}`,
     `  Пользователь: ${trade.senderName ?? "не удалось определить"}`,
     `  Забирают: ${formatCards(trade.requestedCards)}`,
     `  Предлагают: ${formatCards(trade.offeredCards)}`,

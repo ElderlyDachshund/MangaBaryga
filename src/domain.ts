@@ -58,6 +58,9 @@ export interface TradeRecord {
   lastAcceptAttemptedAt?: string;
   telegramSent: boolean;
   discoveredAt: string;
+  lastSeenAt: string;
+  lastDetailCheckedAt?: string;
+  missingAt?: string;
   updatedAt: string;
 }
 
@@ -83,7 +86,7 @@ export function createDefaultSettings(): BotSettings {
     lockAllWantedPagesThreshold: 5,
     lockRecentWantedPagesThreshold: 5,
     lockRecentCardsLimit: 100,
-    loopPauseMs: 5_000,
+    loopPauseMs: 10_000,
     browserMode: "headless",
     rankRecognitionVerified: false,
   };

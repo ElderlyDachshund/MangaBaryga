@@ -4,6 +4,8 @@ import { createInterface } from "node:readline/promises";
 import { dirname } from "node:path";
 import { stdin as input, stdout as output } from "node:process";
 import type { BotSettings } from "./domain.js";
+import { assertMangabuffPageReady, clickVerified } from "./browser-safety.js";
+import { installMangabuffNavigationPolicy } from "./navigation-policy.js";
 import { readBrowserProxySettings } from "./proxy.js";
 
 export const mangabuffTradesUrl = "https://mangabuff.ru/trades";
@@ -66,16 +68,21 @@ export async function autoLoginMangabuffSession(options: MangabuffAutoLoginOptio
 
   try {
     await session.page.goto(mangabuffLogoutUrl, { waitUntil: "domcontentloaded", timeout: 20_000 }).catch(() => {});
-    await session.page.goto(mangabuffLoginUrl, { waitUntil: "domcontentloaded", timeout: 20_000 });
+    const loginResponse = await session.page.goto(mangabuffLoginUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: 20_000,
+    });
+    await assertMangabuffPageReady(session.page, loginResponse?.status());
     await session.page.locator('input[name="email"]').first().fill(options.login);
     await session.page.locator('input[name="password"]').first().fill(options.password);
 
     await Promise.all([
       session.page.waitForURL((url) => !url.pathname.includes("/login"), { timeout: 20_000 }).catch(() => undefined),
-      session.page.locator(".login-button").first().click(),
+      clickVerified(session.page.locator(".login-button").first(), "кнопка входа"),
     ]);
 
     await session.page.waitForLoadState("domcontentloaded").catch(() => {});
+    await assertMangabuffPageReady(session.page);
     await session.page.goto(mangabuffTradesUrl, { waitUntil: "domcontentloaded", timeout: 20_000 }).catch(() => {});
 
     const isAuthorized = await isMangabuffAuthorized(session.page);
@@ -164,6 +171,14 @@ export async function openSavedMangabuffSession(
   });
 }
 
+export async function saveBrowserSessionState(
+  session: BrowserSession,
+  storageStatePath = mangabuffStorageStatePath,
+): Promise<void> {
+  await mkdir(dirname(storageStatePath), { recursive: true });
+  await session.context.storageState({ path: storageStatePath });
+}
+
 async function openMangabuffBrowser(options: {
   headless: boolean;
   storageStatePath: string;
@@ -172,6 +187,9 @@ async function openMangabuffBrowser(options: {
   const { chromium } = await import("playwright");
   const browser = await chromium.launch({
     args: ["--disable-dev-shm-usage", "--no-sandbox"],
+    // The full Chromium build is more reliable than chrome-headless-shell on macOS
+    // and also supports the optional headful diagnostics mode.
+    executablePath: chromium.executablePath(),
     headless: options.headless,
     proxy: readBrowserProxySettings(),
   });
@@ -181,7 +199,15 @@ async function openMangabuffBrowser(options: {
         ? options.storageStatePath
         : undefined,
   });
+  await installMangabuffNavigationPolicy(context);
   const page = await context.newPage();
+  page.setDefaultNavigationTimeout(3_660_000);
+
+  context.on("page", (openedPage) => {
+    if (openedPage !== page) {
+      void openedPage.close();
+    }
+  });
 
   return { browser, context, page };
 }

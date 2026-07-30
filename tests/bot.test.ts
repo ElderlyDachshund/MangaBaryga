@@ -10,6 +10,7 @@ import {
   insertNewTrade,
   markMissingTradesAsStale,
   markTradeTelegramSent,
+  markVisibleTradesSeen,
   openDatabase,
   recordTradeCheckFailure,
   updateTradeStatus,
@@ -30,15 +31,23 @@ import { scanVisibleTradesInHttpSession } from "../src/trades.js";
 
 const tradesUrl = "https://mangabuff.ru/trades";
 
-test("HTTP-scan keeps browser entry points out of the bot run path", async () => {
+test("bot run path uses Playwright browser sessions instead of HTTP sessions", async () => {
   const source = await readFile(join(process.cwd(), "src/trades.ts"), "utf8");
   const scanFunction = readFunctionBlock(source, "scanVisibleTrades");
   const loopFunction = readFunctionBlock(source, "runVisibleTradesLoop");
+  const wantedPagesFunction = readFunctionBlock(source, "countWantedPagesForRequestedCard");
+  const acceptFunction = readFunctionBlock(source, "acceptTradeAfterRulesPass");
 
-  assert.match(scanFunction, /openSavedMangabuffHttpSession/);
-  assert.doesNotMatch(scanFunction, /openSavedMangabuffSession/);
-  assert.match(loopFunction, /openSavedMangabuffHttpSession/);
-  assert.doesNotMatch(loopFunction, /openSavedMangabuffSession/);
+  assert.match(scanFunction, /openSavedMangabuffSession/);
+  assert.doesNotMatch(scanFunction, /openSavedMangabuffHttpSession/);
+  assert.match(loopFunction, /openSavedMangabuffSession/);
+  assert.doesNotMatch(loopFunction, /openSavedMangabuffHttpSession/);
+  assert.match(wantedPagesFunction, /openRequestedCardFromTrade/);
+  assert.match(wantedPagesFunction, /openWantedUsersSection/);
+  assert.doesNotMatch(wantedPagesFunction, /context\(\)\.request|fetch\(/);
+  assert.match(acceptFunction, /clickVerified\(acceptButton/);
+  assert.match(acceptFunction, /assertMangabuffPageReady\(page\)/);
+  assert.doesNotMatch(acceptFunction, /postForm/);
 });
 
 test("HTTP session updates cookies from Mangabuff responses before later POST requests", async () => {
@@ -883,6 +892,9 @@ test("technical parsing errors retry once and then become manual review", async 
 
     const first = await scanVisibleTradesInHttpSession(db, session, createDefaultSettings());
     const afterFirst = findTradeById(db, "1005");
+    db.prepare(
+      "UPDATE trades SET last_detail_checked_at = datetime('now', '-25 hours') WHERE trade_id = ?",
+    ).run("1005");
     const second = await scanVisibleTradesInHttpSession(db, session, createDefaultSettings());
     const afterSecond = findTradeById(db, "1005");
 
@@ -916,6 +928,16 @@ test("missing visible trades mark only new and check-error records as stale", as
   });
 });
 
+test("visible trade IDs update local last-seen state without reopening details", async () => {
+  await withDatabase(async (db) => {
+    insertNewTrade(db, "seen-trade", "https://mangabuff.ru/trades/seen-trade");
+    db.prepare("UPDATE trades SET last_seen_at = '2000-01-01 00:00:00' WHERE trade_id = ?").run("seen-trade");
+
+    assert.equal(markVisibleTradesSeen(db, ["seen-trade"]), 1);
+    assert.notEqual(findTradeById(db, "seen-trade")?.lastSeenAt, "2000-01-01 00:00:00");
+  });
+});
+
 test("HTTP scan rechecks a stale trade when it becomes visible again", async () => {
   await withDatabase(async (db) => {
     const session = new FakeHttpSession();
@@ -923,7 +945,8 @@ test("HTTP scan rechecks a stale trade when it becomes visible again", async () 
     const offeredImage = await createRankImage(0.09, 0.8, 0.35);
 
     insertNewTrade(db, "1007", "https://mangabuff.ru/trades/1007");
-    updateTradeStatus(db, "1007", "неактуален", 'Обмен исчез из вкладки "Предложения".');
+    db.prepare("UPDATE trades SET last_detail_checked_at = CURRENT_TIMESTAMP WHERE trade_id = ?").run("1007");
+    markMissingTradesAsStale(db, []);
 
     session.queueText(tradesUrl, htmlResponse(tradesUrl, tradesListHtml(["1007"])));
     session.queueText(
@@ -944,6 +967,51 @@ test("HTTP scan rechecks a stale trade when it becomes visible again", async () 
     assert.equal(result.skippedCount, 0);
     assert.equal(result.safeAcceptCount, 1);
     assert.equal(trade?.status, "бот_бы_принял");
+  });
+});
+
+test("HTTP scan opens no more than five new trade details per pass", async () => {
+  await withDatabase(async (db) => {
+    const session = new FakeHttpSession();
+    const tradeIds = ["2001", "2002", "2003", "2004", "2005", "2006"];
+
+    session.queueText(tradesUrl, htmlResponse(tradesUrl, tradesListHtml(tradeIds)));
+
+    for (const tradeId of tradeIds.slice(0, 5)) {
+      session.queueText(
+        `https://mangabuff.ru/trades/${tradeId}`,
+        htmlResponse(
+          `https://mangabuff.ru/trades/${tradeId}`,
+          "<html><body>Предложение обмена без блока trade</body></html>",
+        ),
+      );
+    }
+
+    const result = await scanVisibleTradesInHttpSession(db, session, createDefaultSettings());
+
+    assert.equal(result.insertedCount, 6);
+    assert.equal(result.processedCount, 5);
+    assert.equal(result.skippedCount, 1);
+    assert.equal(findTradeById(db, "2006")?.status, "новое");
+    assert.equal(findTradeById(db, "2006")?.lastDetailCheckedAt, undefined);
+    assert.ok(!session.textUrls.includes("https://mangabuff.ru/trades/2006"));
+  });
+});
+
+test("unchanged technical-error detail is not reopened for 24 hours", async () => {
+  await withDatabase(async (db) => {
+    const session = new FakeHttpSession();
+
+    insertNewTrade(db, "2010", "https://mangabuff.ru/trades/2010");
+    recordTradeCheckFailure(db, "2010", "Временная ошибка.");
+    db.prepare("UPDATE trades SET last_detail_checked_at = CURRENT_TIMESTAMP WHERE trade_id = ?").run("2010");
+    session.queueText(tradesUrl, htmlResponse(tradesUrl, tradesListHtml(["2010"])));
+
+    const result = await scanVisibleTradesInHttpSession(db, session, createDefaultSettings());
+
+    assert.equal(result.processedCount, 0);
+    assert.equal(result.skippedCount, 1);
+    assert.deepEqual(session.textUrls, [tradesUrl]);
   });
 });
 
@@ -1422,7 +1490,11 @@ function normalizeUrl(url: string): string {
 }
 
 function readFunctionBlock(source: string, functionName: string): string {
-  const start = source.indexOf(`export async function ${functionName}`);
+  let start = source.indexOf(`export async function ${functionName}`);
+
+  if (start === -1) {
+    start = source.indexOf(`async function ${functionName}`);
+  }
 
   assert.notEqual(start, -1, `Function ${functionName} was not found`);
 

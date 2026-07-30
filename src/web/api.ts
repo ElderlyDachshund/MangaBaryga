@@ -27,6 +27,11 @@ export type ApiRuntimePass =
       status: "temporary_error";
       passNumber: number;
       reason: string;
+    }
+  | {
+      status: "blocked";
+      passNumber: number;
+      reason: string;
     };
 
 export interface ApiSettings {

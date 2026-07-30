@@ -7,15 +7,18 @@ import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   cancelMangabuffManualAuth,
+  autoLoginMangabuffSession,
+  checkMangabuffSession,
   completeMangabuffManualAuth,
   mangabuffTradesUrl,
   mangabuffStorageStatePath,
+  openSavedMangabuffSession,
+  saveBrowserSessionState,
   startMangabuffManualAuth,
   type ManualAuthSession,
 } from "./browser.js";
 import {
-  runCardLockingInHttpSession,
-  saveCardLockingSession,
+  runCardLockingInBrowserSession,
   type CardLockingError,
   type CardLockingMode,
   type CardLockingProgress,
@@ -30,11 +33,6 @@ import {
 } from "./db.js";
 import type { BotSettings } from "./domain.js";
 import { formatError, logError, logInfo, logWarn } from "./logger.js";
-import {
-  autoLoginMangabuffHttpSession,
-  checkSavedMangabuffHttpSession,
-  openSavedMangabuffHttpSession,
-} from "./mangabuff-http.js";
 import { readMangabuffProxyUrl } from "./proxy.js";
 import { runVisibleTradesLoop, type TradesPassResult } from "./trades.js";
 import { assertTelegramConfigured } from "./telegram.js";
@@ -236,7 +234,10 @@ function createControlApp(): Hono {
   });
 
   app.get("/api/auth/status", async (context) => {
-    const authorized = await checkSavedMangabuffHttpSession();
+    const authorized =
+      runtime.running || cardLockingAbortController
+        ? authRuntime.authorized ?? true
+        : await checkSavedMangabuffBrowserSession();
 
     if (authorized) {
       markAuthAuthorized("status_endpoint");
@@ -269,6 +270,10 @@ async function startBot(db: AppDatabase): Promise<void> {
     return;
   }
 
+  if (cardLockingAbortController) {
+    throw new HttpError(409, "Сначала остановите проверку карт: допускается только одна активная вкладка Mangabuff.");
+  }
+
   const settings = loadRuntimeSettings(db);
   logInfo("Bot start requested", {
     autoAcceptEnabled: settings.autoAcceptEnabled,
@@ -284,7 +289,7 @@ async function startBot(db: AppDatabase): Promise<void> {
   const authorized = await ensureSavedMangabuffSessionAuthorized();
 
   if (!authorized) {
-    logWarn("Saved Mangabuff HTTP session is not authorized");
+    logWarn("Saved Mangabuff browser session is not authorized");
     throw new HttpError(400, "Нужна авторизация Mangabuff.");
   }
 
@@ -352,6 +357,10 @@ async function startCardLocking(db: AppDatabase, body: unknown): Promise<void> {
     throw new HttpError(409, "Проверка карт уже выполняется.");
   }
 
+  if (runtime.running) {
+    throw new HttpError(409, "Сначала остановите бота обменов: допускается только одна активная вкладка Mangabuff.");
+  }
+
   const request = parseCardLockingStartRequest(body);
   const settingsPatch: Partial<BotSettings> =
     request.mode === "all"
@@ -369,7 +378,7 @@ async function startCardLocking(db: AppDatabase, body: unknown): Promise<void> {
     throw new HttpError(400, "Нужна авторизация Mangabuff.");
   }
 
-  const session = await openSavedMangabuffHttpSession();
+  const session = await openSavedMangabuffSession(loadRuntimeSettings(db));
   const controller = new AbortController();
   cardLockingAbortController = controller;
   Object.assign(cardLockingRuntime, createEmptyCardLockingRuntime(), {
@@ -386,7 +395,7 @@ async function startCardLocking(db: AppDatabase, body: unknown): Promise<void> {
     threshold: request.threshold,
   });
 
-  void runCardLockingInHttpSession(session, {
+  void runCardLockingInBrowserSession(session, {
     mode: request.mode,
     threshold: request.threshold,
     recentLimit: request.recentLimit,
@@ -408,11 +417,14 @@ async function startCardLocking(db: AppDatabase, body: unknown): Promise<void> {
       cardLockingRuntime.currentPage = undefined;
       cardLockingAbortController = undefined;
 
-      await saveCardLockingSession(session).catch((error) => {
-        logWarn("Could not persist Mangabuff cookies after card locking", {
-          error: formatError(error),
+      if (cardLockingRuntime.status !== "error") {
+        await saveBrowserSessionState(session).catch((error) => {
+          logWarn("Could not persist Mangabuff cookies after card locking", {
+            error: formatError(error),
+          });
         });
-      });
+      }
+      await session.browser.close().catch(() => {});
 
       logInfo("Card locking stopped", {
         checkedCount: cardLockingRuntime.checkedCount,
@@ -464,6 +476,13 @@ function createEmptyCardLockingRuntime(): CardLockingRuntimeState {
 }
 
 async function startManualAuth(): Promise<void> {
+  if (runtime.running || cardLockingAbortController) {
+    throw new HttpError(
+      409,
+      "Сначала остановите активную работу Mangabuff: допускается только одна активная вкладка.",
+    );
+  }
+
   if (manualAuthSession) {
     if (await focusManualAuth(manualAuthSession)) {
       return;
@@ -563,7 +582,12 @@ function buildState(db: AppDatabase): object {
 async function buildDiagnostics(): Promise<object> {
   const databasePath = process.env.DATABASE_PATH ?? process.env.DB_PATH ?? "data/baryga-manga.sqlite";
   const storageStateExists = await fileExists(mangabuffStorageStatePath);
-  const authorized = storageStateExists ? await checkSavedMangabuffHttpSession().catch(() => false) : false;
+  const authorized =
+    runtime.running || cardLockingAbortController
+      ? authRuntime.authorized ?? true
+      : storageStateExists
+        ? await checkSavedMangabuffBrowserSession().catch(() => false)
+        : false;
 
   return {
     autoStartBot: process.env.AUTO_START_BOT === "true",
@@ -683,8 +707,8 @@ function parseSettingsPatch(body: unknown): Partial<BotSettings> {
   if (source.loopPauseMs !== undefined) {
     const value = Number(source.loopPauseMs);
 
-    if (!Number.isInteger(value) || value < 1_000 || value > 10_000) {
-      throw new HttpError(400, "Пауза между проходами должна быть от 1000 до 10000 мс.");
+    if (!Number.isInteger(value) || value < 5_000 || value > 15_000) {
+      throw new HttpError(400, "Пауза между проходами должна быть от 5000 до 15000 мс.");
     }
 
     patch.loopPauseMs = value;
@@ -864,10 +888,14 @@ function readOptionalBooleanEnv(names: string[]): boolean | undefined {
   throw new Error(`${names[0]} должен быть true или false.`);
 }
 
-async function ensureSavedMangabuffSessionAuthorized(): Promise<boolean> {
-  logInfo("Checking saved Mangabuff HTTP session");
+async function checkSavedMangabuffBrowserSession(): Promise<boolean> {
+  return checkMangabuffSession(loadRuntimeSettings(db));
+}
 
-  if (await checkSavedMangabuffHttpSession()) {
+async function ensureSavedMangabuffSessionAuthorized(): Promise<boolean> {
+  logInfo("Checking saved Mangabuff browser session");
+
+  if (await checkSavedMangabuffBrowserSession()) {
     markAuthAuthorized("saved_session_check");
     return true;
   }
@@ -875,19 +903,19 @@ async function ensureSavedMangabuffSessionAuthorized(): Promise<boolean> {
   const credentials = readMangabuffCredentials();
 
   if (!credentials) {
-    logWarn("Saved Mangabuff HTTP session is not authorized and auto-login credentials are missing");
+    logWarn("Saved Mangabuff browser session is not authorized and auto-login credentials are missing");
     markAuthUnauthorized("missing_credentials");
     return false;
   }
 
-  logWarn("Saved Mangabuff HTTP session is not authorized; trying auto-login");
+  logWarn("Saved Mangabuff browser session is not authorized; trying auto-login");
 
   if (!(await runMangabuffAutoLogin(credentials, "startup_auth_check"))) {
     scheduleAuthRecovery("startup_auth_check_failed");
     return false;
   }
 
-  const authorized = await checkSavedMangabuffHttpSession();
+  const authorized = await checkSavedMangabuffBrowserSession();
 
   if (authorized) {
     markAuthAuthorized("post_autologin_check");
@@ -991,7 +1019,10 @@ async function runMangabuffAutoLogin(
   try {
     authRuntime.lastAttemptAt = new Date().toISOString();
     logInfo("Mangabuff auto-login started", { reason });
-    const saved = await autoLoginMangabuffHttpSession(credentials);
+    const saved = await autoLoginMangabuffSession({
+      ...credentials,
+      headless: loadRuntimeSettings(db).browserMode === "headless",
+    });
     logInfo("Mangabuff auto-login finished", {
       reason,
       saved,
@@ -1038,6 +1069,14 @@ function logTradesPass(result: TradesPassResult): void {
 
   if (result.status === "temporary_error") {
     logWarn("Bot pass finished with a temporary error", {
+      passNumber: result.passNumber,
+      reason: result.reason,
+    });
+    return;
+  }
+
+  if (result.status === "blocked") {
+    logWarn("Bot stopped after a Mangabuff protection page was detected", {
       passNumber: result.passNumber,
       reason: result.reason,
     });
@@ -1196,7 +1235,7 @@ async function runAuthRecovery(): Promise<void> {
     botRunning: runtime.running,
   });
 
-  if (await checkSavedMangabuffHttpSession().catch(() => false)) {
+  if (await checkSavedMangabuffBrowserSession().catch(() => false)) {
     markAuthAuthorized("background_saved_session_check");
     await maybeRestartBotAfterAuthRecovery();
     return;
@@ -1209,7 +1248,7 @@ async function runAuthRecovery(): Promise<void> {
     return;
   }
 
-  const authorized = await checkSavedMangabuffHttpSession().catch(() => false);
+  const authorized = await checkSavedMangabuffBrowserSession().catch(() => false);
 
   if (!authorized) {
     markAuthUnauthorized("background_post_autologin_check_failed");
