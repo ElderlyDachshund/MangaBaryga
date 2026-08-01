@@ -29,6 +29,42 @@ test("navigation policy delays the eighty-first navigation until the hourly wind
   assert.equal(calculateNavigationWaitMs(hourlyHistory, now, limits), 100_001);
 });
 
+test("navigation policy keeps a minimum gap even when the window budget is free", () => {
+  const spacedLimits: NavigationLimits = { minGapMs: 800, perHour: 80, perMinute: 8 };
+  const now = 1_000_000;
+
+  // Budget is untouched, so only the gap since the previous navigation can delay us.
+  assert.equal(calculateNavigationWaitMs([now - 300], now, spacedLimits), 500);
+  assert.equal(calculateNavigationWaitMs([now - 800], now, spacedLimits), 0);
+  assert.equal(calculateNavigationWaitMs([], now, spacedLimits), 0);
+});
+
+test("navigation policy without a configured gap keeps the previous burst behaviour", () => {
+  const now = 1_000_000;
+
+  assert.equal(calculateNavigationWaitMs([now - 1], now, limits), 0);
+});
+
+test("navigation limiter spaces out a burst that fits inside the minute budget", async () => {
+  let now = 10_000;
+  const waits: number[] = [];
+  const limiter = new MangabuffNavigationLimiter(
+    { minGapMs: 800, perHour: 100, perMinute: 50 },
+    () => now,
+    async (milliseconds) => {
+      waits.push(milliseconds);
+      now += milliseconds;
+    },
+  );
+
+  await limiter.acquire();
+  await limiter.acquire();
+  await limiter.acquire();
+
+  // The budget alone would let all three through instantly; the gap must not.
+  assert.deepEqual(waits, [800, 800]);
+});
+
 test("navigation limiter serializes concurrent callers", async () => {
   let now = 10_000;
   const waits: number[] = [];
@@ -67,7 +103,9 @@ test("navigation limiter applies server backoff without charging refreshes to th
 
 test("navigation backoff respects Retry-After and has conservative defaults", () => {
   assert.equal(calculateNavigationBackoffMs(429, "12"), 12_000);
-  assert.equal(calculateNavigationBackoffMs(429, undefined), 60_000);
+  // Mangabuff sends no Retry-After and recovers in ~5 seconds, so the default that
+  // actually applies to every 429 is a short pause rather than a full minute.
+  assert.equal(calculateNavigationBackoffMs(429, undefined), 10_000);
   assert.equal(calculateNavigationBackoffMs(503, undefined), 15_000);
   assert.equal(calculateNavigationBackoffMs(200, "12"), 0);
 });

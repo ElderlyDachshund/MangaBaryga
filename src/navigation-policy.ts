@@ -5,6 +5,14 @@ const minuteMs = 60_000;
 const hourMs = 60 * minuteMs;
 
 export interface NavigationLimits {
+  /**
+   * Smallest gap between two counted navigations. The rolling budgets below only cap
+   * how many requests fit in a window, so without this floor the worker may fire the
+   * whole minute budget back to back. Mangabuff answers such a burst with 429 once it
+   * drains a token bucket measured at ~32 requests refilling at ~1.33/s, so staying
+   * above 750 ms keeps the bot below the refill rate no matter how long it runs.
+   */
+  minGapMs?: number;
   perHour: number;
   perMinute: number;
 }
@@ -12,8 +20,10 @@ export interface NavigationLimits {
 // The worker now leaves the offers index after every pass and opens every due trade,
 // so the rolling budget has to cover away/return navigations plus trade details.
 export const defaultNavigationLimits: NavigationLimits = {
+  minGapMs: readIntegerEnv("MANGABUFF_NAVIGATION_MIN_GAP_MS", 800, 0, 10_000),
   perHour: readIntegerEnv("MANGABUFF_NAVIGATIONS_PER_HOUR", 300, 1, 2_000),
-  perMinute: readIntegerEnv("MANGABUFF_NAVIGATIONS_PER_MINUTE", 20, 1, 60),
+  // 40 per minute is already 0.67/s; anything faster leaves no room under the bucket.
+  perMinute: readIntegerEnv("MANGABUFF_NAVIGATIONS_PER_MINUTE", 20, 1, 40),
 };
 
 export function calculateNavigationWaitMs(
@@ -24,6 +34,13 @@ export function calculateNavigationWaitMs(
   const hourEntries = timestamps.filter((timestamp) => timestamp > now - hourMs);
   const minuteEntries = hourEntries.filter((timestamp) => timestamp > now - minuteMs);
   let waitMs = 0;
+
+  const minGapMs = limits.minGapMs ?? 0;
+  const previousNavigation = timestamps[timestamps.length - 1];
+
+  if (minGapMs > 0 && previousNavigation !== undefined) {
+    waitMs = Math.max(waitMs, previousNavigation + minGapMs - now);
+  }
 
   if (minuteEntries.length >= limits.perMinute) {
     const blockingTimestamp = minuteEntries[minuteEntries.length - limits.perMinute];
@@ -122,7 +139,10 @@ export function calculateNavigationBackoffMs(
   now = Date.now(),
 ): number {
   if (status === 429) {
-    return parseRetryAfterMs(retryAfter, now) ?? 60_000;
+    // Mangabuff never sends Retry-After, so this default is what actually applies.
+    // Measured recovery after a 429 is ~5 seconds; a full minute idles the worker
+    // twelve times longer than the site needs.
+    return parseRetryAfterMs(retryAfter, now) ?? 10_000;
   }
 
   if (status === 502 || status === 503 || status === 504) {

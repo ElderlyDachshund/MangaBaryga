@@ -183,12 +183,12 @@ export class MangabuffHttpSession implements MangabuffSessionClient {
       headers["x-requested-with"] = "XMLHttpRequest";
     }
 
-    const response = await proxyAwareFetch(url, {
+    const response = await fetchWithConnectionRetry(url, {
       body: options.body,
       headers,
       method: options.method ?? "GET",
       redirect: "follow",
-      signal: AbortSignal.timeout(timeoutMs),
+      timeoutMs,
     });
 
     this.storeResponseCookies(response, url);
@@ -688,9 +688,90 @@ function isFileMissingError(error: unknown): boolean {
   );
 }
 
-const defaultRequestDelayMs = readIntegerEnv("MANGABUFF_HTTP_REQUEST_DELAY_MS", 1_500, 250, 30_000);
+// Mangabuff throttles with a token bucket measured at ~32 requests refilling at
+// ~1.33/s, so the floor stays above 750 ms: anything faster drains the bucket and
+// earns a 429 within a minute of sustained traffic.
+const defaultRequestDelayMs = readIntegerEnv("MANGABUFF_HTTP_REQUEST_DELAY_MS", 1_500, 750, 30_000);
 const defaultRequestJitterMs = readIntegerEnv("MANGABUFF_HTTP_REQUEST_JITTER_MS", 750, 0, 30_000);
-const defaultRateLimitRetryMs = readIntegerEnv("MANGABUFF_HTTP_RATE_LIMIT_RETRY_MS", 30_000, 1_000, 120_000);
+// The site sends no Retry-After and recovers in ~5 seconds, so this default applies
+// to every 429 and only needs a small safety margin over the measured recovery.
+const defaultRateLimitRetryMs = readIntegerEnv("MANGABUFF_HTTP_RATE_LIMIT_RETRY_MS", 10_000, 1_000, 120_000);
+const connectionRetryAttempts = 3;
+const connectionRetryDelayMs = 5_000;
+
+/**
+ * Mangabuff sits behind DDoS-Guard, which silently drops a connection instead of
+ * refusing it whenever too many are opened at once. That surfaces as a thrown
+ * `fetch failed` or a connect timeout rather than a status code, so the status-based
+ * retries elsewhere never see it. Measurements found this to be the only failure the
+ * site actually produces, so every request gets a few attempts before giving up.
+ */
+export async function fetchWithConnectionRetry(
+  url: string,
+  options: {
+    body?: BodyInit;
+    headers: Record<string, string>;
+    method: string;
+    redirect: RequestRedirect;
+    timeoutMs: number;
+  },
+  attempts = connectionRetryAttempts,
+  delayMs = connectionRetryDelayMs,
+  fetchImpl = proxyAwareFetch,
+): Promise<Response> {
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await fetchImpl(url, {
+        body: options.body,
+        headers: options.headers,
+        method: options.method,
+        redirect: options.redirect,
+        // A signal can only be consumed once, so every attempt needs its own.
+        signal: AbortSignal.timeout(options.timeoutMs),
+      });
+    } catch (error) {
+      lastError = error;
+
+      if (attempt === attempts || !isConnectionError(error)) {
+        throw error;
+      }
+
+      logWarn("Mangabuff connection dropped, retrying", {
+        attempt,
+        attempts,
+        delayMs,
+        error: error instanceof Error ? error.message : String(error),
+        url,
+      });
+      await sleep(delayMs);
+    }
+  }
+
+  throw lastError;
+}
+
+/** Network-level failures worth retrying, as opposed to a real HTTP answer. */
+export function isConnectionError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const message = `${error.name} ${error.message}`.toLowerCase();
+
+  return (
+    message.includes("fetch failed") ||
+    message.includes("timeouterror") ||
+    message.includes("timed out") ||
+    message.includes("socket") ||
+    message.includes("econnreset") ||
+    message.includes("econnrefused") ||
+    message.includes("enotfound") ||
+    message.includes("etimedout") ||
+    message.includes("network")
+  );
+}
 
 function readRetryAfterMs(response: Response): number | undefined {
   const retryAfter = response.headers.get("retry-after");
