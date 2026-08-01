@@ -1,5 +1,26 @@
 # MangaBaryga
 
+## Локальный запуск
+
+Полная пошаговая инструкция по первому входу, запуску бота, работе с веб-панелью
+и диагностике: [docs/local-run.ru.md](docs/local-run.ru.md).
+
+Короткий безопасный запуск:
+
+```sh
+npm ci
+npx playwright install chromium
+cp .env.example .env
+# Заполни секреты в .env и оставь SAFE_MODE=true
+npm run auth:auto
+npm run check-auth
+npm run build
+npm run serve
+```
+
+После этого открой `http://127.0.0.1:3017`. Для обычной работы рекомендуется
+единый `npm run serve`: он одновременно держит API и отдаёт собранную панель.
+
 ## Deploy
 
 This app is not a static Vite site. It must run the Node server from `dist/index.js`,
@@ -24,7 +45,10 @@ session open and behaves like the normal UI flow:
 3. Open the trade, click the requested card, then click `Хотят получить`.
 4. Read the visible pagination, recognize ranks from images loaded by the page, and
    apply the existing accept/drop rules.
-5. Return to the offers index before processing the next trade.
+5. Press back to the offers list — the stale one, without reloading it — and take the
+   next trade from there.
+6. Reload the offers index once after the last processed trade, so the finished
+   offers disappear and are recorded as stale.
 
 Acceptance and card locking are also done with visible page buttons. The production
 worker does not call Mangabuff endpoints through Node `fetch`, `request.get`, or a
@@ -33,17 +57,32 @@ hand-built form POST.
 The offers index is the canonical signal source. A numeric ID is new only when it is
 visible there and `INSERT OR IGNORE` creates a local SQLite row. The notification page is not polled,
 because opening it can change unread state and it is less reliable than the complete
-offers list. The worker opens at most five due details per pass, waits 10–15 seconds
-between them, and cools unchanged details down for 24 hours. `discovered_at` means
+offers list. The worker opens every due detail in a pass, waits 10–15 seconds between
+them, and cools unchanged details down for 24 hours. `discovered_at` means
 “first observed locally”, not “sent by MangaBuff”.
 
-The same single page visits `/feed` every 3 minutes, the home page every 10 minutes,
-and `/manga` every 20 minutes. Away-navigation is limited to 8 per minute and 80 per
-hour; refresh polling of an already open `/trades` index remains on the configured
-5–15 second cadence.
+After every pass the worker leaves the offers index for another page and waits there,
+so `Предложения` is opened as a fresh visit instead of being refreshed in place. Due
+background routes win: `/feed` around every 3 minutes, the home page around every
+10 minutes, and `/manga` around every 20 minutes, each randomized by ±25% (2:15–3:45,
+7:30–12:30, 15:00–25:00). When nothing is due, the closest route is pulled forward,
+so the pause is normally spent on `/feed`. While waiting there the page is scrolled
+and the pointer is moved, and no link is clicked. Offers checks use a randomized
+30–60 second cadence (the panel value is the minimum, doubled at most). Away-navigation
+is limited to 20 per minute and 300 per hour. Sustained live tests triggered Mangabuff
+CAPTCHA at both 5-second and 40-second minimum cadences, so a sub-minute cadence is a
+deliberate trade of stealth for speed; raise the panel pause to slow it back down.
+
+Every click on a Mangabuff control lands on a random point inside the central 60% of
+the target, moves the pointer there in several steps, hesitates 80–320 ms, and holds
+the button for 40–140 ms, so the bot never presses the same pixel twice.
 
 The browser needs more memory than the old HTTP worker. Use at least 512 MB; 1 GB is
 recommended for the server, Chromium, SQLite, and the control panel together.
+The default browser mode is visible (`headful`). If Mangabuff shows CAPTCHA, the
+worker keeps that Chromium context open, does not click the challenge, and resumes
+in the same session after the challenge disappears. Telegram reports both detection
+and successful continuation.
 
 ## Browser authentication
 

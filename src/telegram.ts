@@ -30,6 +30,45 @@ export async function sendAuthRequiredNotification(settings: BotSettings): Promi
   await sendTelegramMessage(settings, "Нужно заново войти в Mangabuff");
 }
 
+export type CaptchaNotificationEvent = "cleared" | "detected" | "test";
+
+export async function sendCaptchaNotification(
+  settings: BotSettings,
+  event: CaptchaNotificationEvent,
+  url?: string,
+): Promise<void> {
+  assertTelegramConfigured(settings);
+  await sendTelegramMessage(settings, formatCaptchaNotification(event, url));
+}
+
+export function formatCaptchaNotification(
+  event: CaptchaNotificationEvent,
+  url?: string,
+): string {
+  const lines =
+    event === "detected"
+      ? [
+          "⚠️ Mangabuff запросил CAPTCHA",
+          "Бот ничего не нажимает и ждёт в открытом окне Chromium.",
+          "Если проверка не пройдёт сама, подтверди её вручную.",
+        ]
+      : event === "cleared"
+        ? [
+            "✅ CAPTCHA Mangabuff пройдена",
+            "Бот продолжил работу в той же браузерной сессии.",
+          ]
+        : [
+            "✅ Тест уведомлений CAPTCHA",
+            "Telegram-уведомления бота настроены и работают.",
+          ];
+
+  if (url) {
+    lines.push(`Ссылка: ${url}`);
+  }
+
+  return lines.join("\n");
+}
+
 function formatTradeProblemMessage(trade: TradeRecord): string {
   return [
     "Проблемный обмен Mangabuff",

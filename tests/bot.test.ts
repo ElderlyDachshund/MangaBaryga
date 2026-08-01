@@ -37,6 +37,7 @@ test("bot run path uses Playwright browser sessions instead of HTTP sessions", a
   const loopFunction = readFunctionBlock(source, "runVisibleTradesLoop");
   const wantedPagesFunction = readFunctionBlock(source, "countWantedPagesForRequestedCard");
   const acceptFunction = readFunctionBlock(source, "acceptTradeAfterRulesPass");
+  const processTradeFunction = readFunctionBlock(source, "processVisibleTrade");
 
   assert.match(scanFunction, /openSavedMangabuffSession/);
   assert.doesNotMatch(scanFunction, /openSavedMangabuffHttpSession/);
@@ -48,6 +49,10 @@ test("bot run path uses Playwright browser sessions instead of HTTP sessions", a
   assert.match(acceptFunction, /clickVerified\(acceptButton/);
   assert.match(acceptFunction, /assertMangabuffPageReady\(page\)/);
   assert.doesNotMatch(acceptFunction, /postForm/);
+  assert.match(
+    processTradeFunction,
+    /if \(error instanceof MangabuffInteractionBlockedError\) \{\s+throw error;/,
+  );
 });
 
 test("HTTP session updates cookies from Mangabuff responses before later POST requests", async () => {
@@ -970,14 +975,14 @@ test("HTTP scan rechecks a stale trade when it becomes visible again", async () 
   });
 });
 
-test("HTTP scan opens no more than five new trade details per pass", async () => {
+test("HTTP scan opens every due trade detail in one pass", async () => {
   await withDatabase(async (db) => {
     const session = new FakeHttpSession();
     const tradeIds = ["2001", "2002", "2003", "2004", "2005", "2006"];
 
     session.queueText(tradesUrl, htmlResponse(tradesUrl, tradesListHtml(tradeIds)));
 
-    for (const tradeId of tradeIds.slice(0, 5)) {
+    for (const tradeId of tradeIds) {
       session.queueText(
         `https://mangabuff.ru/trades/${tradeId}`,
         htmlResponse(
@@ -990,11 +995,13 @@ test("HTTP scan opens no more than five new trade details per pass", async () =>
     const result = await scanVisibleTradesInHttpSession(db, session, createDefaultSettings());
 
     assert.equal(result.insertedCount, 6);
-    assert.equal(result.processedCount, 5);
-    assert.equal(result.skippedCount, 1);
-    assert.equal(findTradeById(db, "2006")?.status, "новое");
-    assert.equal(findTradeById(db, "2006")?.lastDetailCheckedAt, undefined);
-    assert.ok(!session.textUrls.includes("https://mangabuff.ru/trades/2006"));
+    assert.equal(result.processedCount, 6);
+    assert.equal(result.skippedCount, 0);
+
+    for (const tradeId of tradeIds) {
+      assert.ok(session.textUrls.includes(`https://mangabuff.ru/trades/${tradeId}`));
+      assert.ok(findTradeById(db, tradeId)?.lastDetailCheckedAt);
+    }
   });
 });
 
@@ -1490,10 +1497,10 @@ function normalizeUrl(url: string): string {
 }
 
 function readFunctionBlock(source: string, functionName: string): string {
-  let start = source.indexOf(`export async function ${functionName}`);
+  let start = source.indexOf(`export async function ${functionName}(`);
 
   if (start === -1) {
-    start = source.indexOf(`async function ${functionName}`);
+    start = source.indexOf(`async function ${functionName}(`);
   }
 
   assert.notEqual(start, -1, `Function ${functionName} was not found`);

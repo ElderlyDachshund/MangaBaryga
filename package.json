@@ -18,6 +18,7 @@
     "serve": "tsx src/index.ts serve",
     "start": "node dist/index.js serve",
     "test": "node --import tsx --test \"tests/**/*.test.ts\"",
+    "test:captcha-browser": "tsx scripts/test-captcha-browser.ts",
     "verify-ranks": "tsx src/index.ts verify-ranks",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx src/index.ts"

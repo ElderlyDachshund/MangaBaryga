@@ -411,9 +411,9 @@ export function App() {
                         value={settingsForm.maxWantedPagesExclusive}
                       />
                     </Field>
-                    <Field label="Пауза между проходами, мс">
+                    <Field label="Минимальная пауза между проходами, мс">
                       <Input
-                        max={15_000}
+                        max={180_000}
                         min={5_000}
                         onChange={(event) =>
                           setSettingsForm((current) => ({
@@ -940,8 +940,8 @@ function createEmptySettingsForm(): SettingsForm {
     lockAllWantedPagesThreshold: "5",
     lockRecentWantedPagesThreshold: "5",
     lockRecentCardsLimit: "100",
-    loopPauseMs: "10000",
-    browserMode: "headless",
+    loopPauseMs: "30000",
+    browserMode: "headful",
     safeMode: true,
     autoAcceptEnabled: false,
   };
@@ -997,6 +997,10 @@ function formatLastPass(pass: ApiRuntimePass | undefined, lastError: string | un
   }
 
   if (pass?.status === "blocked") {
+    if (pass.interruption === "captcha") {
+      return `Бот ждёт прохождения CAPTCHA в открытом окне Chromium. ${pass.reason}`;
+    }
+
     return `Бот остановлен защитой Mangabuff. ${pass.reason}`;
   }
 

@@ -24,9 +24,13 @@ import {
 } from "./browser.js";
 import {
   addPositiveJitterMs,
+  addSymmetricJitterMs,
   assertMangabuffPageReady,
   clickVerified,
   MangabuffInteractionBlockedError,
+  type MangabuffInterruption,
+  performIdlePageActivity,
+  waitForMangabuffCaptchaToClear,
 } from "./browser-safety.js";
 import {
   isMangabuffAuthorizedHttpResponse,
@@ -43,14 +47,20 @@ import {
   recognizeCardRankFromImageBytes,
 } from "./ranks.js";
 import { passesDefaultRankRule, passesWantedPagesRule } from "./rules.js";
-import { sendAuthRequiredNotification, sendTradeProblemNotification } from "./telegram.js";
+import { logInfo, logWarn } from "./logger.js";
+import {
+  sendAuthRequiredNotification,
+  sendCaptchaNotification,
+  sendTradeProblemNotification,
+} from "./telegram.js";
 import { buildWantedOffersUrl, countWantedUsersPagesFromHtml } from "./wanted-pages.js";
 
 const tradePassTimeoutMs = readIntegerEnv("MANGABUFF_TRADE_PASS_TIMEOUT_MS", 3_600_000, 45_000, 3_600_000);
 const tradePauseMinMs = readIntegerEnv("MANGABUFF_TRADE_PAUSE_MIN_MS", 10_000, 0, 60_000);
 const tradePauseMaxMs = readIntegerEnv("MANGABUFF_TRADE_PAUSE_MAX_MS", 15_000, 0, 60_000);
 const tradeListMaxPages = readIntegerEnv("MANGABUFF_TRADE_LIST_MAX_PAGES", 10, 1, 50);
-const maxTradeDetailsPerPass = readIntegerEnv("MANGABUFF_TRADE_DETAILS_PER_PASS", 5, 1, 5);
+// 0 means "no per-pass cap": every due trade is opened, still spaced by the trade pauses.
+const maxTradeDetailsPerPass = readIntegerEnv("MANGABUFF_TRADE_DETAILS_PER_PASS", 0, 0, 500);
 const unchangedTradeDetailCooldownMs = readIntegerEnv(
   "MANGABUFF_TRADE_DETAIL_COOLDOWN_MS",
   24 * 60 * 60 * 1_000,
@@ -62,6 +72,11 @@ const backgroundPageIntervals = [
   { intervalMs: 10 * 60_000, url: "https://mangabuff.ru/" },
   { intervalMs: 20 * 60_000, url: "https://mangabuff.ru/manga" },
 ] as const;
+const backgroundPageJitterFraction = 0.25;
+// A trade detail is at most three steps deep: offers → trade → card → "Хотят получить".
+const maxHistoryBackSteps = 5;
+// The offers index is left after every pass, so the pause is spent on another page.
+const offersPauseJitterFraction = readFloatEnv("MANGABUFF_OFFERS_PAUSE_JITTER_FRACTION", 1, 0, 3);
 
 export interface VisibleTrade {
   tradeId: string;
@@ -96,7 +111,7 @@ export interface TradesLoopOptions {
 
 export type BotSettingsSource = BotSettings | (() => BotSettings);
 
-interface BackgroundPageScheduleEntry {
+export interface BackgroundPageScheduleEntry {
   intervalMs: number;
   nextVisitAt: number;
   url: string;
@@ -121,6 +136,7 @@ export type TradesPassResult =
       status: "blocked";
       passNumber: number;
       reason: string;
+      interruption: MangabuffInterruption;
     };
 
 export async function scanVisibleTrades(
@@ -162,13 +178,14 @@ export async function runVisibleTradesLoop(
 
       if (result.status === "ok") {
         try {
-          await visitDueBackgroundPages(session.page, backgroundSchedule, options.signal);
+          await visitAwayPage(session.page, backgroundSchedule, options.signal);
         } catch (error) {
           if (error instanceof MangabuffInteractionBlockedError) {
             result = {
               status: "blocked",
               passNumber,
               reason: error.message,
+              interruption: error.interruption,
             };
           } else {
             throw error;
@@ -189,6 +206,46 @@ export async function runVisibleTradesLoop(
       }
 
       if (result.status === "blocked") {
+        if (result.interruption === "captcha") {
+          logWarn("Mangabuff CAPTCHA detected; waiting in the current browser session", {
+            passNumber,
+            url: session.page.url(),
+          });
+          await sendCaptchaNotification(
+            currentSettings,
+            "detected",
+            session.page.url(),
+          ).catch((error) => {
+            logWarn("Could not send Mangabuff CAPTCHA notification", {
+              error: formatError(error),
+              passNumber,
+            });
+          });
+
+          const captchaCleared = await waitForMangabuffCaptchaToClear(session.page, {
+            signal: options.signal,
+          });
+
+          if (captchaCleared) {
+            logInfo("Mangabuff CAPTCHA cleared; continuing in the current browser session", {
+              passNumber,
+              url: session.page.url(),
+            });
+            await saveBrowserSessionState(session).catch(() => {});
+            await sendCaptchaNotification(
+              currentSettings,
+              "cleared",
+              session.page.url(),
+            ).catch((error) => {
+              logWarn("Could not send Mangabuff CAPTCHA cleared notification", {
+                error: formatError(error),
+                passNumber,
+              });
+            });
+            continue;
+          }
+        }
+
         break;
       }
 
@@ -207,37 +264,113 @@ export async function runVisibleTradesLoop(
 function createBackgroundPageSchedule(now = Date.now()): BackgroundPageScheduleEntry[] {
   return backgroundPageIntervals.map((entry) => ({
     ...entry,
-    nextVisitAt: now + entry.intervalMs,
+    nextVisitAt: now + randomizeBackgroundInterval(entry.intervalMs),
   }));
 }
 
-async function visitDueBackgroundPages(
+/**
+ * The worker always leaves the offers index after a pass, so the pause between checks
+ * is spent on an ordinary page instead of sitting on (and refreshing) `Предложения`.
+ */
+async function visitAwayPage(
   page: Page,
   schedule: BackgroundPageScheduleEntry[],
   signal?: AbortSignal,
 ): Promise<void> {
-  for (const entry of schedule) {
-    if (signal?.aborted || Date.now() < entry.nextVisitAt) {
-      continue;
-    }
-
-    try {
-      const response = await page.goto(entry.url, { waitUntil: "domcontentloaded" });
-      await page.waitForTimeout(400);
-      await assertMangabuffPageReady(page, response?.status());
-    } catch (error) {
-      if (error instanceof MangabuffInteractionBlockedError) {
-        throw error;
-      }
-
-      continue;
-    }
-
-    const now = Date.now();
-    do {
-      entry.nextVisitAt += entry.intervalMs;
-    } while (entry.nextVisitAt <= now);
+  if (signal?.aborted) {
+    return;
   }
+
+  const selectedIndex = selectBackgroundPageIndex(schedule);
+
+  if (selectedIndex === undefined) {
+    return;
+  }
+
+  const entry = schedule[selectedIndex];
+
+  try {
+    const response = await page.goto(entry.url, { waitUntil: "domcontentloaded" });
+    const status = response?.status();
+    await page.waitForTimeout(400);
+    await assertMangabuffPageReady(page, status);
+
+    if (status !== undefined && status >= 400) {
+      throw new Error(`Mangabuff вернул HTTP ${status} для фоновой страницы.`);
+    }
+
+    await performIdlePageActivity(page, { signal });
+
+    logInfo("Background Mangabuff page visited", {
+      status,
+      url: entry.url,
+    });
+  } catch (error) {
+    if (error instanceof MangabuffInteractionBlockedError) {
+      throw error;
+    }
+
+    logWarn("Background Mangabuff page visit failed", {
+      error: formatError(error),
+      url: entry.url,
+    });
+  } finally {
+    entry.nextVisitAt = Date.now() + randomizeBackgroundInterval(entry.intervalMs);
+  }
+}
+
+export function selectDueBackgroundPageIndex(
+  schedule: readonly BackgroundPageScheduleEntry[],
+  now = Date.now(),
+  randomValue = Math.random(),
+): number | undefined {
+  const dueIndices = schedule.flatMap((entry, index) =>
+    now >= entry.nextVisitAt ? [index] : [],
+  );
+
+  return pickRandomIndex(dueIndices, randomValue);
+}
+
+/**
+ * Every pass needs a page to wait on. Due routes win; otherwise the closest one is
+ * pulled forward, which keeps the short-interval routes as the usual idle place.
+ */
+export function selectBackgroundPageIndex(
+  schedule: readonly BackgroundPageScheduleEntry[],
+  now = Date.now(),
+  randomValue = Math.random(),
+): number | undefined {
+  const dueIndex = selectDueBackgroundPageIndex(schedule, now, randomValue);
+
+  if (dueIndex !== undefined) {
+    return dueIndex;
+  }
+
+  if (schedule.length === 0) {
+    return undefined;
+  }
+
+  const earliestVisitAt = Math.min(...schedule.map((entry) => entry.nextVisitAt));
+  const earliestIndices = schedule.flatMap((entry, index) =>
+    entry.nextVisitAt === earliestVisitAt ? [index] : [],
+  );
+
+  return pickRandomIndex(earliestIndices, randomValue);
+}
+
+function pickRandomIndex(indices: number[], randomValue: number): number | undefined {
+  if (indices.length === 0) {
+    return undefined;
+  }
+
+  const normalizedRandom = Math.min(1, Math.max(0, randomValue));
+  const position = Math.min(indices.length - 1, Math.floor(normalizedRandom * indices.length));
+
+  return indices[position];
+}
+
+function randomizeBackgroundInterval(intervalMs: number): number {
+  return addSymmetricJitterMs(intervalMs, backgroundPageJitterFraction);
 }
 
 async function runTradesPass(
@@ -257,7 +390,12 @@ async function runTradesPass(
     }
 
     if (error instanceof MangabuffInteractionBlockedError) {
-      return { status: "blocked", passNumber, reason };
+      return {
+        status: "blocked",
+        passNumber,
+        reason,
+        interruption: error.interruption,
+      };
     }
 
     return { status: "temporary_error", passNumber, reason };
@@ -450,7 +588,7 @@ export async function scanVisibleTradesInSession(
   }
   markVisibleTradesSeen(db, visibleTrades.map((trade) => trade.tradeId));
 
-  const staleCount = fullyScanned
+  let staleCount = fullyScanned
     ? markMissingTradesAsStale(
         db,
         visibleTrades.map((trade) => trade.tradeId),
@@ -509,6 +647,10 @@ export async function scanVisibleTradesInSession(
     }
   }
 
+  if (processingStats.processedCount > 0) {
+    staleCount += await refreshOffersIndexAfterProcessing(db, session.page);
+  }
+
   return {
     visibleTrades,
     insertedCount,
@@ -518,6 +660,42 @@ export async function scanVisibleTradesInSession(
     skippedTradeIds: formatSkippedTradeIds(skippedStats),
     visibleTradePageCount,
   };
+}
+
+/**
+ * The index is never reloaded while trades are being processed: the worker steps back
+ * through history instead. One real reload happens after the last processed trade, so
+ * finished offers disappear from the list and are recorded as stale right away.
+ */
+async function refreshOffersIndexAfterProcessing(db: AppDatabase, page: Page): Promise<number> {
+  try {
+    await openTradesPage(page);
+    await openOffersTab(page);
+
+    const { fullyScanned, visibleTrades } = await scanVisibleTradeLinksInBrowser(page);
+    const visibleTradeIds = visibleTrades.map((trade) => trade.tradeId);
+
+    markVisibleTradesSeen(db, visibleTradeIds);
+    const staleCount = fullyScanned ? markMissingTradesAsStale(db, visibleTradeIds) : 0;
+
+    logInfo("Offers index refreshed after processing", {
+      staleCount,
+      visibleCount: visibleTrades.length,
+    });
+
+    return staleCount;
+  } catch (error) {
+    if (error instanceof MangabuffInteractionBlockedError) {
+      throw error;
+    }
+
+    // The pass results are already stored; a failed cleanup only delays it by one pass.
+    logWarn("Could not refresh the offers index after processing", {
+      error: formatError(error),
+    });
+
+    return 0;
+  }
 }
 
 async function scanVisibleTradeLinksInBrowser(
@@ -569,6 +747,10 @@ async function openTradeListPage(page: Page, pageNumber: number): Promise<void> 
 }
 
 async function returnToOffersIndex(page: Page): Promise<void> {
+  if (await goBackToOffersIndex(page)) {
+    return;
+  }
+
   const offersLink = page.locator('a[href="/trades"], a[href="https://mangabuff.ru/trades"]').filter({
     hasText: /предложения/i,
   });
@@ -581,6 +763,89 @@ async function returnToOffersIndex(page: Page): Promise<void> {
   }
 
   await openTradesPage(page);
+}
+
+/**
+ * Browser history is the cheapest and most ordinary way back to `Предложения`: a
+ * restored page usually costs no request at all, so returning between trades stops
+ * re-fetching the index. Anything unexpected falls back to the visible tab link.
+ */
+export async function goBackToOffersIndex(page: Page): Promise<boolean> {
+  return goBackUntil(page, isOffersIndexUrl, (currentPage) =>
+    currentPage
+      .locator('a[href^="/trades/"]')
+      .first()
+      .isVisible({ timeout: 2_000 })
+      .catch(() => false),
+  );
+}
+
+/**
+ * The same back-button path from the requested card to the trade it belongs to.
+ * A restored trade page can be stale, but the acceptance click is still verified
+ * against a freshly loaded page afterwards.
+ */
+export async function goBackToTradePage(page: Page, tradeUrl: string): Promise<boolean> {
+  const tradePath = readUrlPath(tradeUrl);
+
+  if (!tradePath) {
+    return false;
+  }
+
+  return goBackUntil(
+    page,
+    (url) => readUrlPath(url) === tradePath,
+    (currentPage) =>
+      currentPage
+        .locator(".trade")
+        .first()
+        .isVisible({ timeout: 2_000 })
+        .catch(() => false),
+  );
+}
+
+async function goBackUntil(
+  page: Page,
+  isTargetUrl: (url: string) => boolean,
+  verifyTargetPage: (page: Page) => Promise<boolean>,
+): Promise<boolean> {
+  for (let step = 0; step < maxHistoryBackSteps; step += 1) {
+    const previousUrl = page.url();
+
+    try {
+      await page.goBack({ waitUntil: "domcontentloaded" });
+    } catch {
+      return false;
+    }
+
+    if (page.url() === previousUrl) {
+      // Nothing left in this tab's history.
+      return false;
+    }
+
+    if (!isTargetUrl(page.url())) {
+      continue;
+    }
+
+    await page.waitForTimeout(400);
+    await assertMangabuffPageReady(page);
+
+    return await verifyTargetPage(page);
+  }
+
+  return false;
+}
+
+function isOffersIndexUrl(url: string): boolean {
+  return readUrlPath(url) === "/trades";
+}
+
+function readUrlPath(url: string): string | undefined {
+  try {
+    return new URL(url, "https://mangabuff.ru").pathname.replace(/\/+$/, "") || "/";
+  } catch {
+    return undefined;
+  }
 }
 
 interface SkippedTradeStats {
@@ -621,7 +886,9 @@ function selectTradesForDetailCheck(
     return leftPriority - rightPriority;
   });
 
-  return eligible.slice(0, maxTradeDetailsPerPass).map((observation) => observation.trade);
+  const selected = maxTradeDetailsPerPass > 0 ? eligible.slice(0, maxTradeDetailsPerPass) : eligible;
+
+  return selected.map((observation) => observation.trade);
 }
 
 function createSkippedTradeStats(): SkippedTradeStats {
@@ -964,6 +1231,10 @@ async function processVisibleTrade(
 
     return { processed: true, outcome: "safe_accept", pagesChecked: true, ranksChecked: true };
   } catch (error) {
+    if (error instanceof MangabuffInteractionBlockedError) {
+      throw error;
+    }
+
     const status = recordTradeCheckFailure(
       db,
       trade.tradeId,
@@ -987,7 +1258,10 @@ async function acceptTradeAfterRulesPass(
     return { processed: true, outcome: "manual_review", pagesChecked: true, ranksChecked: true };
   }
 
-  await openTradePage(page, trade.tradeUrl);
+  if (!(await goBackToTradePage(page, trade.tradeUrl))) {
+    await openTradePage(page, trade.tradeUrl);
+  }
+
   const pageState = await getTradePageState(page);
 
   if (pageState === "not_found") {
@@ -1869,7 +2143,10 @@ async function clickFirstVisible(locator: Locator): Promise<boolean> {
         }
       })
       .catch(() => {});
-    await clickVerified(candidate, "переход по видимой ссылке", 3_000);
+    await clickVerified(candidate, "переход по видимой ссылке", {
+      noWaitAfter: true,
+      timeout: 3_000,
+    });
     return true;
   }
 
@@ -2042,7 +2319,7 @@ function escapeRegExp(value: string): string {
 
 async function waitForNextPass(loopPauseMs: number, signal?: AbortSignal): Promise<void> {
   try {
-    await sleep(addPositiveJitterMs(loopPauseMs), undefined, { signal });
+    await sleep(addPositiveJitterMs(loopPauseMs, offersPauseJitterFraction), undefined, { signal });
   } catch (error) {
     if (!signal?.aborted) {
       throw error;
@@ -2095,6 +2372,22 @@ function readIntegerEnv(name: string, fallback: number, min: number, max: number
   const value = Number(rawValue);
 
   if (!Number.isInteger(value) || value < min || value > max) {
+    return fallback;
+  }
+
+  return value;
+}
+
+function readFloatEnv(name: string, fallback: number, min: number, max: number): number {
+  const rawValue = process.env[name];
+
+  if (!rawValue) {
+    return fallback;
+  }
+
+  const value = Number(rawValue);
+
+  if (!Number.isFinite(value) || value < min || value > max) {
     return fallback;
   }
 

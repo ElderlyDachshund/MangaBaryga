@@ -32,6 +32,7 @@ export type ApiRuntimePass =
       status: "blocked";
       passNumber: number;
       reason: string;
+      interruption: "access_denied" | "captcha" | "rate_limited" | "security_challenge";
     };
 
 export interface ApiSettings {

@@ -6,6 +6,7 @@ import {
   openSavedMangabuffSession,
   saveMangabuffSession,
 } from "./browser.js";
+import { readMangabuffCredentials } from "./credentials.js";
 import { listTrades, openDatabase } from "./db.js";
 import { formatError, logError, logInfo } from "./logger.js";
 import { verifyRankSamples } from "./ranks.js";
@@ -25,12 +26,15 @@ switch (command) {
   }
 
   case "auth:auto": {
-    const login = readRequiredEnv("MANGABUFF_LOGIN");
-    const password = readRequiredEnv("MANGABUFF_PASSWORD");
+    const credentials = readMangabuffCredentials();
+
+    if (!credentials) {
+      throw new Error("Нужны переменные окружения MANGABUFF_LOGIN и MANGABUFF_PASSWORD.");
+    }
+
     const saved = await autoLoginMangabuffSession({
       headless: settings.browserMode === "headless",
-      login,
-      password,
+      ...credentials,
     });
 
     if (saved) {
@@ -177,7 +181,7 @@ switch (command) {
     console.log("  --limit=50         Количество записей для list-trades: 1-200");
     console.log("  --headful          Открыть видимый браузер для диагностики");
     console.log("  --auto-accept      Включить рабочий режим: принимать обмены, прошедшие правила");
-    console.log("  --pause-ms=10000   Пауза между проходами: 5000-15000 мс");
+    console.log("  --pause-ms=30000   Минимальная пауза между проходами: 5000-180000 мс");
   }
 }
 
@@ -206,8 +210,8 @@ function applyCliSettings(): void {
 
   const pauseMs = Number(pauseArg.split("=")[1]);
 
-  if (!Number.isInteger(pauseMs) || pauseMs < 5_000 || pauseMs > 15_000) {
-    throw new Error("Пауза между проходами должна быть целым числом от 5000 до 15000 мс.");
+  if (!Number.isInteger(pauseMs) || pauseMs < 5_000 || pauseMs > 180_000) {
+    throw new Error("Пауза между проходами должна быть целым числом от 5000 до 180000 мс.");
   }
 
   settings.loopPauseMs = pauseMs;
@@ -230,16 +234,6 @@ function readFirstOptionalEnv(names: string[]): string | undefined {
   return undefined;
 }
 
-function readRequiredEnv(name: string): string {
-  const value = readOptionalEnv(name);
-
-  if (!value) {
-    throw new Error(`Нужна переменная окружения ${name}.`);
-  }
-
-  return value;
-}
-
 function logTradesPass(result: TradesPassResult): void {
   const time = new Date().toLocaleString("ru-RU");
 
@@ -254,6 +248,13 @@ function logTradesPass(result: TradesPassResult): void {
   }
 
   if (result.status === "blocked") {
+    if (result.interruption === "captcha") {
+      console.log(
+        `[${time}] Проход ${result.passNumber}: CAPTCHA, жду её исчезновения в текущем окне Chromium.`,
+      );
+      return;
+    }
+
     console.log(`[${time}] Проход ${result.passNumber}: бот остановлен. ${result.reason}`);
     return;
   }

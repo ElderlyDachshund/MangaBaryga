@@ -86,8 +86,8 @@ export function createDefaultSettings(): BotSettings {
     lockAllWantedPagesThreshold: 5,
     lockRecentWantedPagesThreshold: 5,
     lockRecentCardsLimit: 100,
-    loopPauseMs: 10_000,
-    browserMode: "headless",
+    loopPauseMs: 30_000,
+    browserMode: "headful",
     rankRecognitionVerified: false,
   };
 }

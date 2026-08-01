@@ -18,6 +18,11 @@ import {
   type ManualAuthSession,
 } from "./browser.js";
 import {
+  hasMangabuffPassword,
+  readMangabuffCredentials,
+  type MangabuffCredentials,
+} from "./credentials.js";
+import {
   runCardLockingInBrowserSession,
   type CardLockingError,
   type CardLockingMode,
@@ -89,11 +94,6 @@ class HttpError extends Error {
   ) {
     super(message);
   }
-}
-
-interface MangabuffCredentials {
-  login: string;
-  password: string;
 }
 
 const webDistDir = join(process.cwd(), "dist", "web");
@@ -185,9 +185,9 @@ function createControlApp(): Hono {
   app.patch("/api/settings", async (context) => {
     const body = await readJsonBody(context.req.raw);
     const patch = parseSettingsPatch(body);
-    const settings = saveSettingsPatch(db, patch);
+    saveSettingsPatch(db, patch);
 
-    return context.json(sanitizeSettings(settings));
+    return context.json(sanitizeSettings(loadRuntimeSettings(db)));
   });
 
   app.post("/api/bot/start", async (context) => {
@@ -597,7 +597,7 @@ async function buildDiagnostics(): Promise<object> {
     mangabuff: {
       authorized,
       hasLogin: Boolean(process.env.MANGABUFF_LOGIN?.trim()),
-      hasPassword: Boolean(process.env.MANGABUFF_PASSWORD?.trim()),
+      hasPassword: hasMangabuffPassword(),
       proxyConfigured: Boolean(readMangabuffProxyUrl()),
       storageStateExists,
       storageStatePath: mangabuffStorageStatePath,
@@ -707,8 +707,8 @@ function parseSettingsPatch(body: unknown): Partial<BotSettings> {
   if (source.loopPauseMs !== undefined) {
     const value = Number(source.loopPauseMs);
 
-    if (!Number.isInteger(value) || value < 5_000 || value > 15_000) {
-      throw new HttpError(400, "Пауза между проходами должна быть от 5000 до 15000 мс.");
+    if (!Number.isInteger(value) || value < 5_000 || value > 180_000) {
+      throw new HttpError(400, "Пауза между проходами должна быть от 5000 до 180000 мс.");
     }
 
     patch.loopPauseMs = value;
@@ -942,7 +942,7 @@ function startAutoLoginRefreshLoop(): void {
   if (!credentials) {
     logWarn("Mangabuff auto-login refresh disabled because credentials are missing", {
       hasLogin: Boolean(process.env.MANGABUFF_LOGIN?.trim()),
-      hasPassword: Boolean(process.env.MANGABUFF_PASSWORD?.trim()),
+      hasPassword: hasMangabuffPassword(),
     });
     return;
   }
@@ -1045,17 +1045,6 @@ async function runMangabuffAutoLogin(
   }
 }
 
-function readMangabuffCredentials(): MangabuffCredentials | undefined {
-  const login = process.env.MANGABUFF_LOGIN?.trim();
-  const password = process.env.MANGABUFF_PASSWORD?.trim();
-
-  if (!login || !password) {
-    return undefined;
-  }
-
-  return { login, password };
-}
-
 function logTradesPass(result: TradesPassResult): void {
   if (result.status === "auth_required") {
     markAuthUnauthorized(result.reason);
@@ -1076,6 +1065,14 @@ function logTradesPass(result: TradesPassResult): void {
   }
 
   if (result.status === "blocked") {
+    if (result.interruption === "captcha") {
+      logWarn("Bot is waiting for Mangabuff CAPTCHA to clear in the current browser session", {
+        passNumber: result.passNumber,
+        reason: result.reason,
+      });
+      return;
+    }
+
     logWarn("Bot stopped after a Mangabuff protection page was detected", {
       passNumber: result.passNumber,
       reason: result.reason,
@@ -1140,7 +1137,7 @@ async function logStartupDiagnostics(hostname: string, port: number): Promise<vo
     WEB_ORIGIN: Array.isArray(webOrigins) ? webOrigins.join(",") : webOrigins,
     databasePath,
     hasMangabuffLogin: Boolean(process.env.MANGABUFF_LOGIN?.trim()),
-    hasMangabuffPassword: Boolean(process.env.MANGABUFF_PASSWORD?.trim()),
+    hasMangabuffPassword: hasMangabuffPassword(),
     hasMangabuffProxy: Boolean(readMangabuffProxyUrl()),
     isVercel: process.env.VERCEL === "1" || process.env.VERCEL === "true",
     mangabuffStorageStatePath,

@@ -149,7 +149,10 @@ export async function checkMangabuffSession(
   });
 
   try {
-    await session.page.goto(mangabuffTradesUrl, { waitUntil: "domcontentloaded" });
+    const response = await session.page.goto(mangabuffTradesUrl, {
+      waitUntil: "domcontentloaded",
+    });
+    await assertMangabuffPageReady(session.page, response?.status());
     return await isMangabuffAuthorized(session.page);
   } finally {
     await session.browser.close();

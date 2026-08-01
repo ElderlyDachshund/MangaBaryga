@@ -64,6 +64,8 @@ interface SettingRow {
 export type AppDatabase = Database.Database;
 
 const defaultTradeRetentionDays = 30;
+const legacyLoopPauseMs = 120_000;
+const legacyLoopPauseMigrationKey = "loopPauseMsLegacyDefaultMigratedAt";
 
 export function openDatabase(
   path = process.env.DATABASE_PATH ?? process.env.DB_PATH ?? "data/baryga-manga.sqlite",
@@ -431,7 +433,7 @@ function applyStoredSetting(settings: BotSettings, key: string, value: string): 
       }
       break;
     case "loopPauseMs":
-      if (typeof parsed === "number" && Number.isInteger(parsed) && parsed >= 5_000 && parsed <= 15_000) {
+      if (typeof parsed === "number" && Number.isInteger(parsed) && parsed >= 5_000 && parsed <= 180_000) {
         settings.loopPauseMs = parsed;
       }
       break;
@@ -461,6 +463,43 @@ function migrateDatabase(db: AppDatabase): void {
      WHERE last_seen_at IS NULL`,
   ).run();
   backfillRankRuleResults(db);
+  migrateLegacyLoopPause(db);
+}
+
+/**
+ * The offers cadence default dropped from 120 to 30 seconds when the worker started
+ * leaving the offers index between passes. A database written before that keeps the
+ * old default and silently overrides the new one, so it is rewritten once. The marker
+ * row makes this a one-time fix: a deliberate 120000 set later is left alone.
+ */
+function migrateLegacyLoopPause(db: AppDatabase): void {
+  const marker = db
+    .prepare("SELECT value FROM settings WHERE key = ?")
+    .get(legacyLoopPauseMigrationKey) as SettingRow | undefined;
+
+  if (marker) {
+    return;
+  }
+
+  const stored = db.prepare("SELECT key, value FROM settings WHERE key = 'loopPauseMs'").get() as
+    | SettingRow
+    | undefined;
+
+  if (stored && Number(stored.value) === legacyLoopPauseMs) {
+    db.prepare(
+      `UPDATE settings
+       SET value = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE key = 'loopPauseMs'`,
+    ).run(JSON.stringify(createDefaultSettings().loopPauseMs));
+  }
+
+  db.prepare(
+    `INSERT INTO settings (key, value, updated_at)
+     VALUES (?, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT(key) DO UPDATE SET
+       value = excluded.value,
+       updated_at = CURRENT_TIMESTAMP`,
+  ).run(legacyLoopPauseMigrationKey, JSON.stringify(new Date().toISOString()));
 }
 
 function ensureColumn(

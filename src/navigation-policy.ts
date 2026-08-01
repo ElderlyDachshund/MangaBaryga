@@ -9,9 +9,11 @@ export interface NavigationLimits {
   perMinute: number;
 }
 
+// The worker now leaves the offers index after every pass and opens every due trade,
+// so the rolling budget has to cover away/return navigations plus trade details.
 export const defaultNavigationLimits: NavigationLimits = {
-  perHour: readIntegerEnv("MANGABUFF_NAVIGATIONS_PER_HOUR", 80, 1, 80),
-  perMinute: readIntegerEnv("MANGABUFF_NAVIGATIONS_PER_MINUTE", 8, 1, 8),
+  perHour: readIntegerEnv("MANGABUFF_NAVIGATIONS_PER_HOUR", 300, 1, 2_000),
+  perMinute: readIntegerEnv("MANGABUFF_NAVIGATIONS_PER_MINUTE", 20, 1, 60),
 };
 
 export function calculateNavigationWaitMs(
